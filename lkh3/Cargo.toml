@@ -1,0 +1,22 @@
+[package]
+name = "lkh3"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+bytes = { workspace = true }
+h3 = { path = "../deps/h3/h3" }
+h3-quinn = { path = "../deps/h3/h3-quinn" }
+http = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+rand_core = { workspace = true }
+
+[dev-dependencies]
+quinn = { path = "../deps/quinn/quinn", default-features = false, features = ["runtime-tokio", "rustls", "ring"] }
+rcgen = "0.14"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+serde_json = { workspace = true }
+rand_chacha = { workspace = true }

@@ -1,0 +1,88 @@
+{
+  "$schema": "TlsProfile",
+  "$comment": "Charles HTTP debugging proxy 4.6.7 TLS fingerprint — older Charles release (~2019) running on Java 8 SSLEngine. Differs from charles_5_1.json in two Java 8-era specifics: (1) tls_min_version is tls11 because Java 8 still negotiated TLS 1.0/1.1 by default, and (2) session_id_length is 32 because the JDK 8 SSLEngine sent a 32-byte legacy_session_id placeholder on every ClientHello (later Java 11+ stopped doing this on fresh connections, which is why Charles 5.1 captures show session_id_length=0). Cipher list, signature algorithms, and the fixed raw payloads of ext 50 (signature_algorithms_cert) and ext 17 (status_request_v2) are identical to 5.1. SNI (ext 0) was missing from the original capture (capture tool stripped it for privacy) but is added at position 0 because Java SSLEngine has always emitted SNI first; without it any virtual-hosted origin silently drops the ClientHello. Not byte-verified against a real Charles 4.6.7 capture — derived from a fingerprint export shared by the user. For byte-verified accuracy use charles_5_1.json instead.",
+
+  "name": "Charles 4.6.7",
+
+  "tls_client_hello_style": "java_jsse",
+
+  "tls_min_version": "tls11",
+  "tls_max_version": "tls12",
+
+  "session_id_length": 32,
+
+  "cipher_suites": [
+    49195, 49199, 49196, 49200,
+    52393, 52392,
+    49171, 49172,
+    156,   157,
+    47,    53
+  ],
+
+  "compression_methods": [0],
+  "ec_point_formats": [0],
+
+  "supported_groups": [
+    29, 23, 24, 25, 30
+  ],
+
+  "signature_algorithms": [
+    1027, 1283, 1539,
+    2052, 2053, 2054,
+    2057, 2058, 2059,
+    1025, 1281, 1537,
+    1026,
+    771,  769,  770,
+    515,  513,  514
+  ],
+
+  "alpn_protocols": ["h2", "http/1.1"],
+
+  "key_share_curves": [],
+
+  "compress_cert_algorithms": null,
+  "alps_protocols": null,
+  "record_size_limit": null,
+  "delegated_credentials": null,
+
+  "grease": {
+    "cipher_suite": false,
+    "extensions": false,
+    "supported_groups": false,
+    "supported_versions": false,
+    "signature_algorithms": false,
+    "key_share": false
+  },
+
+  "padding": {
+    "type": "none"
+  },
+
+  "extensions": [
+    { "extension_type": 0,     "source": { "type": "auto" }, "_comment": "server_name (SNI) — Java SSLEngine always emits SNI first; original capture stripped it for privacy" },
+    { "extension_type": 5,     "source": { "type": "auto" }, "_comment": "status_request (OCSP stapling)" },
+    { "extension_type": 10,    "source": { "type": "auto" }, "_comment": "supported_groups" },
+    { "extension_type": 11,    "source": { "type": "auto" }, "_comment": "ec_point_formats" },
+    { "extension_type": 13,    "source": { "type": "auto" }, "_comment": "signature_algorithms" },
+    {
+      "extension_type": 50,
+      "source": {
+        "type": "raw_bytes",
+        "data": "00260403050306030804080508060809080a080b0401050106010402030303010302020302010202"
+      },
+      "_comment": "signature_algorithms_cert (Java explicitly emits this; payload is the same 19-entry list as ext 13, length 0x0026 = 38 bytes)"
+    },
+    { "extension_type": 16,    "source": { "type": "auto" }, "_comment": "ALPN (h2, http/1.1)" },
+    {
+      "extension_type": 17,
+      "source": {
+        "type": "raw_bytes",
+        "data": "000702000400000000"
+      },
+      "_comment": "status_request_v2 (Java/JDK only; list len 7, OCSP-MULTI type 2, responder_id_list/extensions all empty)"
+    },
+    { "extension_type": 23,    "source": { "type": "auto" }, "_comment": "extended_master_secret" },
+    { "extension_type": 43,    "source": { "type": "auto" }, "_comment": "supported_versions (Java still sends this even when capped at TLS 1.2; auto-generated from tls_min/max_version)" },
+    { "extension_type": 65281, "source": { "type": "auto" }, "_comment": "renegotiation_info" }
+  ]
+}

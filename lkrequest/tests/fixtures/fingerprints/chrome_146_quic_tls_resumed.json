@@ -1,0 +1,137 @@
+{
+  "alpn_protocols": [
+    "h3"
+  ],
+  "alps_protocols": null,
+  "cipher_suites": [
+    2570,
+    4865,
+    4866,
+    4867
+  ],
+  "compress_cert_algorithms": [
+    2
+  ],
+  "compression_methods": [
+    0
+  ],
+  "ec_point_formats": [],
+  "extensions": [
+    {
+      "extension_type": 2570,
+      "source": {
+        "type": "grease"
+      }
+    },
+    {
+      "extension_type": 45,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 10,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 51,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 65037,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 16,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 0,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 27,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 13,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 42,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 43,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 57,
+      "source": {
+        "type": "auto"
+      }
+    },
+    {
+      "extension_type": 2570,
+      "source": {
+        "type": "grease"
+      }
+    },
+    {
+      "extension_type": 41,
+      "source": {
+        "type": "auto"
+      }
+    }
+  ],
+  "has_ech": true,
+  "has_padding": false,
+  "key_share_curves": [
+    2570,
+    4588,
+    29
+  ],
+  "legacy_version": 771,
+  "record_size_limit": null,
+  "session_id_length": 0,
+  "signature_algorithms": [
+    1027,
+    2052,
+    1025,
+    1283,
+    2053,
+    1281,
+    2054,
+    1537,
+    513
+  ],
+  "supported_groups": [
+    2570,
+    4588,
+    29,
+    23,
+    24
+  ],
+  "supported_versions": [
+    2570,
+    772
+  ]
+}

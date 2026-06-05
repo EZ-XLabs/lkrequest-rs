@@ -1,0 +1,15 @@
+[package]
+name = "pcap-diff"
+version = "0.1.0"
+edition = "2021"
+description = "Byte-level ClientHello comparison tool with TLS field annotations"
+publish = false
+
+[[bin]]
+name = "pcap-diff"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+colored = "3"

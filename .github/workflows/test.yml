@@ -1,0 +1,31 @@
+name: test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cargo test (workspace, Tier 0 — no ignored tests)
+        run: cargo test --workspace
+
+      - name: LLVM coverage (core crates; threshold is a floor — raise over time)
+        run: >
+          cargo llvm-cov test
+          -p lktls -p lkrequest -p lkh2 -p lkprofile -p lkh3 -p lkquic -p lktls-quic
+          --fail-under-lines 75

@@ -1,0 +1,19 @@
+[package]
+name = "lkquic"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = ["quinn-backend"]
+quinn-backend = ["dep:quinn", "dep:quinn-proto"]
+
+[dependencies]
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+quinn = { workspace = true, optional = true, features = ["runtime-tokio", "ring", "rustls"] }
+quinn-proto = { workspace = true, optional = true, features = ["ring"] }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rcgen = "0.13"

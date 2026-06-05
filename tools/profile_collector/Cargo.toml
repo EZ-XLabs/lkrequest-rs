@@ -1,0 +1,35 @@
+[package]
+name = "profile-collector"
+version = "0.1.0"
+edition = "2021"
+description = "Extract TLS, HTTP/2, and QUIC/HTTP3 fingerprint profiles from hex dumps or live captures"
+publish = false
+
+[[bin]]
+name = "profile-collector"
+path = "src/main.rs"
+
+[dependencies]
+lkprofile = { path = "../../lkprofile" }
+lktls = { path = "../../lktls" }
+lkh2 = { path = "../../lkh2" }
+lkh3 = { path = "../../lkh3" }
+clap = { version = "4", features = ["derive"] }
+hex = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = { workspace = true }
+tokio = { workspace = true }
+quinn = { workspace = true, features = ["runtime-tokio", "ring", "rustls"] }
+quinn-udp = { workspace = true }
+h3 = { path = "../../deps/h3/h3", features = ["i-implement-a-third-party-backend-and-opt-into-breaking-changes"] }
+aes = { workspace = true }
+
+# TLS server (for capture with H2 fingerprinting)
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rcgen = "0.14"
+rustls-pemfile = "2"
+
+# Hashing (Akamai fingerprint)
+sha2 = "0.10"
+md-5 = "0.10"

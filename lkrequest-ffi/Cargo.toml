@@ -1,0 +1,35 @@
+[package]
+name = "lkrequest-ffi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+debug-registry = []
+quic-h3 = ["lkrequest/quic-h3"]
+# Synthetic (Tier 3a/3b) fingerprint randomization. Mirrors lkrequest's
+# off-by-default `synthetic-fp`; without it the recombine/full randomize modes
+# return an error instead of being applied (off/extension_order always work).
+synthetic-fp = ["lkrequest/synthetic-fp"]
+# Aggregate operational counters (bandwidth/connections/requests) behind
+# `lk_metrics_snapshot`. The symbol is always present; this feature makes it
+# report real numbers instead of zeros.
+telemetry = ["lkrequest/telemetry"]
+
+[dependencies]
+lkrequest = { path = "../lkrequest" }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+http = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+
+[dev-dependencies]
+flate2 = { workspace = true }

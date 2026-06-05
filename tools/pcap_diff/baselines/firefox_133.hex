@@ -1,0 +1,21 @@
+# Firefox 133 ClientHello Baseline
+# ================================
+# Captured from: Firefox 133.x on Windows 11
+# Target host: example.com
+# Date: TODO — replace with actual capture date
+#
+# How to capture:
+#   1. Open Wireshark, filter: "tls.handshake.type == 1"
+#   2. Open Firefox 133, navigate to https://example.com/api/all
+#   3. Right-click the ClientHello packet → Copy → "...as Hex Stream"
+#   4. Paste the hex bytes below (whitespace and comments are ignored)
+#
+# TODO: Replace this placeholder with actual captured hex bytes.
+# The hex should start with "16 03 01" (TLS Record Header).
+#
+# Key Firefox differences vs Chrome:
+#   - Different cipher suite order
+#   - record_size_limit extension present
+#   - delegated_credentials extension present
+#   - No ALPS extension
+#   - Different GREASE behavior

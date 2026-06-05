@@ -1,0 +1,90 @@
+{
+  "$schema": "TlsProfile",
+  "$comment": "Firefox 147 TLS Fingerprint Profile. Calibrated from tlsleak/firefox147.0.3_tlsleak.json (browserleaks capture). Firefox 147 uses X25519MLKEM768 key share, compress_certificate (zlib+brotli+zstd), delegated_credentials, record_size_limit, no GREASE, no ALPS, no padding, no encrypt_then_mac.",
+
+  "name": "Firefox 147",
+
+  "tls_client_hello_style": "firefox_nss",
+
+  "tls_min_version": "tls12",
+  "tls_max_version": "tls13",
+
+  "session_id_length": 32,
+
+  "cipher_suites": [
+    4865,  4867,  4866,
+    49195, 49199, 52393, 52392,
+    49196, 49200,
+    49162, 49161, 49171, 49172,
+    156,   157,
+    47,    53
+  ],
+
+  "compression_methods": [0],
+
+  "ec_point_formats": [0],
+
+  "supported_groups": [
+    4588, 29, 23, 24, 25, 256, 257
+  ],
+
+  "signature_algorithms": [
+    1027, 1283, 1539,
+    2052, 2053, 2054,
+    1025, 1281, 1537,
+    515,  513
+  ],
+
+  "alpn_protocols": ["h2", "http/1.1"],
+
+  "key_share_curves": [4588, 29, 23],
+
+  "record_size_limit": 16385,
+
+  "compress_cert_algorithms": [1, 2, 3],
+
+  "delegated_credentials": {
+    "signature_algorithms": [1027, 1283, 1539, 515]
+  },
+
+  "grease": {
+    "cipher_suite": false,
+    "extensions": false,
+    "supported_groups": false,
+    "supported_versions": false,
+    "signature_algorithms": false
+  },
+
+  "padding": {
+    "type": "none"
+  },
+
+  "ech": {
+    "type": "grease",
+    "kdf_id": 1,
+    "aead_id": 3,
+    "enc_length": 32,
+    "payload_length_min": 128,
+    "payload_length_max": 240
+  },
+
+  "extensions": [
+    { "extension_type": 0,     "source": { "type": "auto" }, "_comment": "server_name (SNI)" },
+    { "extension_type": 23,    "source": { "type": "auto" }, "_comment": "extended_master_secret" },
+    { "extension_type": 65281, "source": { "type": "auto" }, "_comment": "renegotiation_info" },
+    { "extension_type": 10,    "source": { "type": "auto" }, "_comment": "supported_groups" },
+    { "extension_type": 11,    "source": { "type": "auto" }, "_comment": "ec_point_formats" },
+    { "extension_type": 35,    "source": { "type": "auto" }, "_comment": "session_ticket" },
+    { "extension_type": 16,    "source": { "type": "auto" }, "_comment": "ALPN" },
+    { "extension_type": 5,     "source": { "type": "auto" }, "_comment": "status_request (OCSP)" },
+    { "extension_type": 34,    "source": { "type": "auto" }, "_comment": "delegated_credentials" },
+    { "extension_type": 18,    "source": { "type": "auto" }, "_comment": "signed_certificate_timestamp (SCT)" },
+    { "extension_type": 51,    "source": { "type": "auto" }, "_comment": "key_share" },
+    { "extension_type": 43,    "source": { "type": "auto" }, "_comment": "supported_versions" },
+    { "extension_type": 13,    "source": { "type": "auto" }, "_comment": "signature_algorithms" },
+    { "extension_type": 45,    "source": { "type": "auto" }, "_comment": "psk_key_exchange_modes" },
+    { "extension_type": 28,    "source": { "type": "auto" }, "_comment": "record_size_limit" },
+    { "extension_type": 27,    "source": { "type": "auto" }, "_comment": "compress_certificate" },
+    { "extension_type": 65037, "source": { "type": "auto" }, "_comment": "encrypted_client_hello (ECH GREASE outer)" }
+  ]
+}

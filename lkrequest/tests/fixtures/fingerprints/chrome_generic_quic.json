@@ -1,0 +1,82 @@
+{
+  "connection_id_length": 0,
+  "extra_transport_parameters": [],
+  "grease_settings": true,
+  "grease_transport_params": false,
+  "h3_settings": [
+    [
+      1,
+      65536
+    ],
+    [
+      6,
+      262144
+    ],
+    [
+      7,
+      100
+    ],
+    [
+      51,
+      1
+    ]
+  ],
+  "h3_settings_fingerprint": "1:65536;6:262144;7:100;51:1",
+  "h3_settings_hash": "766911b264ace59f10e4028b429669df274476b6f23b6653bb292e003b86617c",
+  "initial_destination_connection_id_length": null,
+  "packetization": {
+    "disable_mtu_discovery": false,
+    "enable_ecn": true,
+    "enable_segmentation_offload": true
+  },
+  "packetization_fingerprint": "initial_mtu:none;initial_datagram_size:none;disable_mtu_discovery:false;enable_segmentation_offload:true;enable_ecn:true;initial_frame_layout:none",
+  "packetization_hash": "2c4d7b8a7944dcd49fa4380c08e70019cc6fdb26d30c38111e1d611c24b3a958",
+  "priority_updates": [],
+  "pseudo_header_order": [
+    ":method",
+    ":authority",
+    ":scheme",
+    ":path"
+  ],
+  "pseudo_header_order_token": "masp",
+  "send_control_grease_frame": true,
+  "send_min_ack_delay": true,
+  "send_reserved_transport_parameter": true,
+  "transport_fingerprint": "max_idle_timeout:30000;initial_max_data:15728640;initial_max_stream_data_bidi_local:6291456;initial_max_stream_data_bidi_remote:6291456;initial_max_stream_data_uni:6291456;initial_max_streams_bidi:100;initial_max_streams_uni:100;active_connection_id_limit:2;send_min_ack_delay:true;send_reserved_transport_parameter:true",
+  "transport_hash": "d2f6456286e8c219aea4849b90c9bc4e86d6ae0b341c361261fefcb3177e0f51",
+  "transport_parameter_order": [],
+  "transport_parameters": [
+    [
+      "max_idle_timeout",
+      30000
+    ],
+    [
+      "initial_max_data",
+      15728640
+    ],
+    [
+      "initial_max_stream_data_bidi_local",
+      6291456
+    ],
+    [
+      "initial_max_stream_data_bidi_remote",
+      6291456
+    ],
+    [
+      "initial_max_stream_data_uni",
+      6291456
+    ],
+    [
+      "initial_max_streams_bidi",
+      100
+    ],
+    [
+      "initial_max_streams_uni",
+      100
+    ],
+    [
+      "active_connection_id_limit",
+      2
+    ]
+  ]
+}

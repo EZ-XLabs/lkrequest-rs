@@ -1,0 +1,8 @@
+[submodule "deps/quinn"]
+	path = deps/quinn
+	url = https://github.com/EZ-XLabs/lkrequest-quinn.git
+	branch = lkrequest-patches
+[submodule "deps/h3"]
+	path = deps/h3
+	url = https://github.com/EZ-XLabs/lkrequest-h3.git
+	branch = lkrequest-patches

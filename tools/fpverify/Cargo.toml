@@ -1,0 +1,12 @@
+[package]
+name = "fpverify"
+version = "0.1.0"
+edition = "2021"
+description = "Fingerprint regression verification — isolated, not user-facing"
+publish = false
+
+[dependencies]
+lkprofile = { path = "../../lkprofile" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"

@@ -1,0 +1,36 @@
+[package]
+name = "lktls"
+version = "0.1.0"
+edition = "2021"
+description = "Sans-I/O TLS fingerprint protocol engine for lkrequest"
+
+[dependencies]
+aws-lc-rs = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
+hpke = { workspace = true }
+rand_core = { workspace = true }
+rustls-webpki = { workspace = true }
+webpki-roots = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bytes = { workspace = true }
+brotli = { workspace = true }
+flate2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5" }
+tracing-subscriber = { version = "0.3", features = ["registry"] }
+rcgen = { version = "0.14", features = ["aws_lc_rs"] }
+rand_chacha = { workspace = true }
+
+[[bench]]
+name = "crypto_bench"
+harness = false
+
+[[bench]]
+name = "handshake_bench"
+harness = false

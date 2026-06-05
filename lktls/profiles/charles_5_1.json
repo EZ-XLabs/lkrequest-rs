@@ -1,0 +1,88 @@
+{
+  "$schema": "TlsProfile",
+  "$comment": "Charles HTTP debugging proxy 5.1 TLS fingerprint — verified against a real Wireshark capture of Charles forwarding traffic to example.com. Charles is written in Java, so the wire format reflects the JDK 11+ SSLEngine defaults: TLS 1.2 only (no TLS 1.3 cipher suites, no TLS 1.1 either), no GREASE, no ALPS, no compress_certificate, full Java signature_algorithms list (RSA-PSS / ECDSA / RSA-PKCS1 / legacy DSA), signature_algorithms_cert (ext 50) and status_request_v2 (ext 17) with fixed raw payloads. legacy_session_id is empty (length 0) on fresh connections — Java SSLEngine does NOT send a 32-byte session_id placeholder unlike browsers. Extension order: SNI → status_request → supported_groups → ec_point_formats → sigalgs → sigalgs_cert → alpn → status_request_v2 → extended_master_secret → supported_versions → renegotiation_info. When Charles is used as a MITM, the H2 frames it forwards to the origin still look like the original browser (Chrome here, akamai hash 52d84b11737d980aef856699f885ca86) — the H2 fingerprint does NOT belong in this TlsProfile and is recorded separately.",
+
+  "name": "Charles 5.1",
+
+  "tls_client_hello_style": "java_jsse",
+
+  "tls_min_version": "tls12",
+  "tls_max_version": "tls12",
+
+  "session_id_length": 0,
+
+  "cipher_suites": [
+    49195, 49199, 49196, 49200,
+    52393, 52392,
+    49171, 49172,
+    156,   157,
+    47,    53
+  ],
+
+  "compression_methods": [0],
+  "ec_point_formats": [0],
+
+  "supported_groups": [
+    29, 23, 24, 25, 30
+  ],
+
+  "signature_algorithms": [
+    1027, 1283, 1539,
+    2052, 2053, 2054,
+    2057, 2058, 2059,
+    1025, 1281, 1537,
+    1026,
+    771,  769,  770,
+    515,  513,  514
+  ],
+
+  "alpn_protocols": ["h2", "http/1.1"],
+
+  "key_share_curves": [],
+
+  "compress_cert_algorithms": null,
+  "alps_protocols": null,
+  "record_size_limit": null,
+  "delegated_credentials": null,
+
+  "grease": {
+    "cipher_suite": false,
+    "extensions": false,
+    "supported_groups": false,
+    "supported_versions": false,
+    "signature_algorithms": false,
+    "key_share": false
+  },
+
+  "padding": {
+    "type": "none"
+  },
+
+  "extensions": [
+    { "extension_type": 0,     "source": { "type": "auto" }, "_comment": "server_name (SNI) — Java SSLEngine emits SNI first, verified by Wireshark capture" },
+    { "extension_type": 5,     "source": { "type": "auto" }, "_comment": "status_request (OCSP stapling)" },
+    { "extension_type": 10,    "source": { "type": "auto" }, "_comment": "supported_groups" },
+    { "extension_type": 11,    "source": { "type": "auto" }, "_comment": "ec_point_formats" },
+    { "extension_type": 13,    "source": { "type": "auto" }, "_comment": "signature_algorithms" },
+    {
+      "extension_type": 50,
+      "source": {
+        "type": "raw_bytes",
+        "data": "00260403050306030804080508060809080a080b0401050106010402030303010302020302010202"
+      },
+      "_comment": "signature_algorithms_cert (Java explicitly emits this; payload is the same 19-entry list as ext 13, length 0x0026 = 38 bytes)"
+    },
+    { "extension_type": 16,    "source": { "type": "auto" }, "_comment": "ALPN (h2, http/1.1)" },
+    {
+      "extension_type": 17,
+      "source": {
+        "type": "raw_bytes",
+        "data": "000702000400000000"
+      },
+      "_comment": "status_request_v2 (Java/JDK only; list len 7, OCSP-MULTI type 2, responder_id_list/extensions all empty)"
+    },
+    { "extension_type": 23,    "source": { "type": "auto" }, "_comment": "extended_master_secret" },
+    { "extension_type": 43,    "source": { "type": "auto" }, "_comment": "supported_versions (Java still sends this even when capped at TLS 1.2)" },
+    { "extension_type": 65281, "source": { "type": "auto" }, "_comment": "renegotiation_info" }
+  ]
+}

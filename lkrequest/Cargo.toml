@@ -1,0 +1,128 @@
+[package]
+name = "lkrequest"
+version = "0.1.0"
+edition = "2021"
+description = "HTTP client with fine-grained TLS fingerprint control"
+
+[features]
+default = ["h2-native"]
+h2-native = ["lkh2/h2-native"]
+quic-h3 = ["dep:lktls-quic", "dep:lkh3", "dep:lkquic", "dep:quinn"]
+# Tier-2 integration tests that hit the public internet (not enabled in default CI).
+network-e2e = []
+# Operational telemetry (bandwidth / connection / request counters). Off by
+# default so non-observed deployments carry zero transport instrumentation.
+telemetry = []
+# Synthetic (Tier 3a/3b) fingerprint randomization — produces fingerprints that
+# match no real browser. Escape hatch for negative-model blocklists; off by
+# default so it can't be enabled by accident against allowlist targets.
+synthetic-fp = ["dep:rand_chacha", "dep:rand_core"]
+
+[dependencies]
+lktls = { path = "../lktls" }
+lktls-quic = { path = "../lktls-quic", optional = true }
+lkh2 = { path = "../lkh2", default-features = false }
+lkh3 = { path = "../lkh3", optional = true }
+lkquic = { path = "../lkquic", optional = true }
+quinn = { workspace = true, optional = true, features = ["runtime-tokio", "ring", "rustls"] }
+arc-swap = { workspace = true }
+parking_lot = { workspace = true }
+aws-lc-rs = { workspace = true }
+rand_chacha = { workspace = true, optional = true }
+rand_core = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true }
+socket2 = { workspace = true }
+libc = { workspace = true }
+tokio = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+bytes = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+url = { workspace = true }
+cookie_store = { workspace = true }
+cookie = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hickory-resolver = { workspace = true }
+async-trait = { workspace = true }
+brotli = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+base64 = { workspace = true }
+bitflags = { workspace = true }
+fastwebsockets = { workspace = true }
+rustls-native-certs = "0.8"
+
+[dev-dependencies]
+lkprofile = { path = "../lkprofile" }
+fpverify = { path = "../tools/fpverify" }
+criterion = { version = "0.5", features = ["async_tokio"] }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+urlencoding = "2"
+tracing-subscriber = { version = "0.3", features = ["registry", "fmt", "env-filter"] }
+h2 = { workspace = true }
+hyper-util = { workspace = true, features = ["server-auto", "http1", "http2"] }
+rcgen = { version = "0.14", features = ["aws_lc_rs"] }
+tokio-rustls = "0.26"
+headless_chrome = "1.0"
+libloading = "0.8"
+h3 = { path = "../deps/h3/h3" }
+h3-quinn = { path = "../deps/h3/h3-quinn" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[[bench]]
+name = "request_bench"
+harness = false
+
+[[bench]]
+name = "offline_bench"
+harness = false
+
+[[example]]
+name = "telemetry_metrics"
+required-features = ["telemetry"]
+
+[[example]]
+name = "basic_h3"
+required-features = ["quic-h3"]
+
+[[example]]
+name = "h3_socks5_force"
+required-features = ["quic-h3"]
+
+[[example]]
+name = "proxy_h3_probe"
+required-features = ["quic-h3"]
+
+[[example]]
+name = "h3_auto_discovery"
+required-features = ["quic-h3"]
+
+[[example]]
+name = "h3_dns_to_response"
+required-features = ["quic-h3"]
+
+[[example]]
+name = "h3_session_resumption"
+required-features = ["quic-h3"]
+
+[[example]]
+name = "h3_vs_h2"
+required-features = ["quic-h3"]
+
+[[test]]
+name = "quic_local_e2e"
+required-features = ["quic-h3"]
+
+[[test]]
+name = "quic_profile_fingerprint"
+required-features = ["quic-h3"]
+
+[[test]]
+name = "quic_network_e2e"
+required-features = ["quic-h3", "network-e2e"]

@@ -1,0 +1,33 @@
+{
+  "headers_priority": {
+    "exclusive": true,
+    "stream_dependency": 0,
+    "weight": 255
+  },
+  "priority_frames": [],
+  "pseudo_header_order": [
+    "method",
+    "authority",
+    "scheme",
+    "path"
+  ],
+  "settings": [
+    {
+      "id": "header_table_size",
+      "value": 65536
+    },
+    {
+      "id": "enable_push",
+      "value": 0
+    },
+    {
+      "id": "initial_window_size",
+      "value": 6291456
+    },
+    {
+      "id": "max_header_list_size",
+      "value": 262144
+    }
+  ],
+  "window_update": 15663105
+}

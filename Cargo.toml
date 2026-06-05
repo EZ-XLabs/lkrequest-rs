@@ -1,0 +1,117 @@
+[workspace]
+resolver = "2"
+members = [
+    "lktls",
+    "lktls-quic",
+    "lkh2",
+    "lkh3",
+    "lkrequest",
+    "lkprofile",
+    "tools/pcap_diff",
+    "tools/profile_collector",
+    "tools/fpverify",
+    "lkrequest-ffi",
+    "lkquic",
+]
+exclude = [
+    "deps/h3/h3",
+    "deps/h3/h3-datagram",
+    "deps/h3/h3-quinn",
+    "deps/quinn/quinn",
+    "deps/quinn/quinn-proto",
+    "deps/quinn/quinn-udp",
+    "tools/cleaner",
+]
+
+[workspace.dependencies]
+quinn = { path = "deps/quinn/quinn", default-features = false }
+quinn-proto = { path = "deps/quinn/quinn-proto", default-features = false }
+quinn-udp = { path = "deps/quinn/quinn-udp", default-features = false }
+
+# Crypto
+aws-lc-rs = { version = "1", features = ["prebuilt-nasm"] }
+aes = "0.8"
+cbc = "0.1"
+hpke = { version = "0.13", default-features = false, features = [
+    "alloc",
+    "x25519",
+] }
+rand_core = { version = "0.9", features = ["os_rng"] }
+# Deterministic RNG for tests only (reproducible-shuffle assertions); not a
+# runtime dependency — the engine is generic over `rand_core::RngCore`.
+rand_chacha = "0.9"
+
+# Certificate verification
+rustls-webpki = { version = "0.103", default-features = false, features = [
+    "aws-lc-rs",
+    "std",
+] }
+webpki-roots = "1"
+rustls-pki-types = "1"
+
+# TCP socket configuration
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+
+# Lock-free shared state
+arc-swap = "1"
+
+# High-performance synchronization
+parking_lot = "0.12"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_urlencoded = "0.7"
+
+# Bytes
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+
+# WebSocket
+fastwebsockets = { version = "0.10", features = ["upgrade"] }
+
+# HTTP
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = [
+    "client",
+    "client-legacy",
+    "tokio",
+] }
+http = "1"
+http-body-util = "0.1"
+h2 = "0.4"
+
+# Compression
+brotli = "8"
+flate2 = "1"
+zstd = "0.13"
+
+# URL parsing
+url = "2"
+
+# Cookie management
+cookie_store = "0.22"
+cookie = "0.18"
+
+# Encoding
+base64 = "0.22"
+
+# Bitflags
+bitflags = "2"
+
+# DNS
+hickory-resolver = { version = "0.26", features = [
+    "tokio",
+    "https-aws-lc-rs",
+    "rustls-platform-verifier",
+] }
+async-trait = "0.1"
+
+# Logging
+tracing = { version = "0.1", features = ["log"] }

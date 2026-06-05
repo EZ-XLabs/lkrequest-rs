@@ -1,0 +1,36 @@
+name: bench
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"
+
+jobs:
+  criterion-quick:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: lkrequest offline bench (quick mode)
+        run: cargo bench -p lkrequest --bench offline_bench -- --quick
+
+      - name: lktls crypto bench (quick mode)
+        run: cargo bench -p lktls --bench crypto_bench -- --quick
+
+      - name: Upload Criterion output
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-target
+          path: target/criterion
+          if-no-files-found: ignore
