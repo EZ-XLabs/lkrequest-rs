@@ -29,6 +29,51 @@ const EXT_PRE_SHARED_KEY: u16 = 0x0029;
 /// one of these, or the engine cannot complete a handshake the server picks.
 const TLS13_CIPHERS: [u16; 3] = [0x1301, 0x1302, 0x1303];
 
+/// Signature algorithms every synthesized profile MUST offer so that a real
+/// server's certificate can actually be verified. If a client's
+/// `signature_algorithms` covers none of the server certificate's key type, the
+/// server aborts the handshake with `handshake_failure(40)` — the dominant cause
+/// of un-negotiable synthetic fingerprints. This is the **negotiability floor**
+/// (distinct from the engine-capability floor above): these three cover the
+/// overwhelming majority of server certificates deployed today.
+///
+/// This is the built-in "universal-accept" default. A future configurable
+/// `NegotiabilityFloor` can widen or (for fidelity) tighten it per target.
+const NEGOTIABLE_SIG_ALGS: [u16; 3] = [
+    0x0804, // rsa_pss_rsae_sha256    — RSA certs, TLS 1.3 CertificateVerify
+    0x0401, // rsa_pkcs1_sha256       — RSA cert chains / TLS 1.2 fallback
+    0x0403, // ecdsa_secp256r1_sha256 — ECDSA P-256 certs
+];
+
+/// The signature-algorithm negotiability floor (see [`NEGOTIABLE_SIG_ALGS`]).
+/// Exposed so `validate`/tests share one source of truth.
+pub fn negotiable_sig_algs() -> &'static [u16] {
+    &NEGOTIABLE_SIG_ALGS
+}
+
+/// How much the synthesizer must guarantee about `signature_algorithms` so the
+/// result stays server-negotiable. Different targets warrant different trade-offs
+/// between JA3/JA4 diversity and browser-plausibility, so this is configurable;
+/// the engine-capability floors (a TLS 1.3 cipher, X25519 in groups+key_share)
+/// are always applied regardless.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum NegotiabilityFloor {
+    /// Recombine sig algs freely, then guarantee the universal-accept core
+    /// ([`NEGOTIABLE_SIG_ALGS`]). Maximum diversity, connects to any server — but
+    /// the resulting sig-alg list matches no single real browser, so a detector
+    /// that models sig-alg *shape* could flag it. The safe default.
+    #[default]
+    Universal,
+    /// Keep the chosen base preset's real `signature_algorithms` unchanged:
+    /// negotiable AND browser-plausible (no synthetic sig-alg anomaly). Prefer
+    /// this against fingerprint-anomaly detectors; other layers still randomize.
+    PresetFamily,
+    /// Recombine freely, then guarantee a caller-supplied set. **Advanced**: if
+    /// the set does not cover the target certificate's key type, negotiation
+    /// fails — the caller owns negotiability.
+    Custom(Vec<u16>),
+}
+
 // ---------------------------------------------------------------------------
 // Capability registry — what the engine can actually negotiate AND perform.
 //
@@ -223,6 +268,7 @@ impl Constraints {
             presets::chrome_147(),
             presets::chrome_148(),
             presets::chrome_149(),
+            presets::chrome_150(),
             presets::firefox_133(),
             presets::firefox_147(),
             presets::safari_18(),
@@ -270,6 +316,28 @@ fn pick_some<T: Clone>(rng: &mut impl RngCore, pool: &[T]) -> Vec<T> {
     v
 }
 
+/// Ensure `sig_algs` offers every member of `required`, prepending any missing
+/// one (so it is preferred) while preserving the rest of the list. A random
+/// recombination can drop negotiation-critical algorithms; this restores them so
+/// the synthesized profile can verify the target server certificate.
+fn ensure_sig_algs(sig_algs: Vec<u16>, required: &[u16]) -> Vec<u16> {
+    let mut missing: Vec<u16> = required
+        .iter()
+        .copied()
+        .filter(|a| !sig_algs.contains(a))
+        .collect();
+    if missing.is_empty() {
+        return sig_algs;
+    }
+    missing.extend(sig_algs);
+    missing
+}
+
+/// [`ensure_sig_algs`] with the universal-accept floor ([`NEGOTIABLE_SIG_ALGS`]).
+fn ensure_negotiable_sig_algs(sig_algs: Vec<u16>) -> Vec<u16> {
+    ensure_sig_algs(sig_algs, &NEGOTIABLE_SIG_ALGS)
+}
+
 /// A random (possibly empty) prefix of a shuffled copy of `pool`.
 fn pick_any<T: Clone>(rng: &mut impl RngCore, pool: &[T]) -> Vec<T> {
     if pool.is_empty() {
@@ -286,10 +354,16 @@ fn pick_any<T: Clone>(rng: &mut impl RngCore, pool: &[T]) -> Vec<T> {
 ///
 /// Recombine v1: pick a real base preset for the extension skeleton, then
 /// recombine the cipher / group / signature-algorithm lists from the
-/// capability-bounded pools, guarantee a negotiable group (X25519), and enable
-/// per-connection extension-order jitter. The result is **always** capability-
-/// safe and passes [`validate`] by construction (verified by property test).
-pub fn synthesize(rng: &mut impl RngCore, constraints: &Constraints) -> TlsProfile {
+/// capability-bounded pools, guarantee a negotiable group (X25519) and the
+/// signature-algorithm negotiability `floor` (so a real server cert always
+/// verifies), and enable per-connection extension-order jitter. The result is
+/// **always** capability-safe *and* server-negotiable, and passes [`validate`]
+/// by construction (verified by property test).
+pub fn synthesize(
+    rng: &mut impl RngCore,
+    constraints: &Constraints,
+    floor: &NegotiabilityFloor,
+) -> TlsProfile {
     let base = &constraints.bases[(rng.next_u64() as usize) % constraints.bases.len()];
     let mut p = base.clone();
 
@@ -312,7 +386,22 @@ pub fn synthesize(rng: &mut impl RngCore, constraints: &Constraints) -> TlsProfi
         p.key_share_curves.push(GROUP_X25519);
     }
 
-    p.signature_algorithms = pick_some(rng, &constraints.sig_algs);
+    // Signature algorithms per the negotiability floor. A bare random subset can
+    // drop rsa_pss_rsae_sha256 / ecdsa_secp256r1_sha256, which servers whose cert
+    // uses them reject with handshake_failure — so every floor keeps the result
+    // verifiable.
+    p.signature_algorithms = match floor {
+        // Keep the base preset's real list — negotiable AND browser-plausible.
+        NegotiabilityFloor::PresetFamily => base.signature_algorithms.clone(),
+        // Recombine, then restore the universal-accept core.
+        NegotiabilityFloor::Universal => {
+            ensure_negotiable_sig_algs(pick_some(rng, &constraints.sig_algs))
+        }
+        // Recombine, then restore the caller's required set.
+        NegotiabilityFloor::Custom(required) => {
+            ensure_sig_algs(pick_some(rng, &constraints.sig_algs), required)
+        }
+    };
 
     // Per-connection extension-order jitter (BoringSSL-style; GREASE pinned).
     p.randomization = Some(RandomizationConfig {
@@ -340,6 +429,8 @@ mod tests {
             ("chrome_147", presets::chrome_147()),
             ("chrome_148", presets::chrome_148()),
             ("chrome_149", presets::chrome_149()),
+            ("chrome_150", presets::chrome_150()),
+            ("chrome_150_quic", presets::chrome_150_quic()),
             ("firefox_133", presets::firefox_133()),
             ("firefox_147", presets::firefox_147()),
             ("safari_18", presets::safari_18()),
@@ -438,7 +529,7 @@ mod tests {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             let mut rng = rand_chacha::ChaCha20Rng::from_seed(bytes);
-            let p = synthesize(&mut rng, &c);
+            let p = synthesize(&mut rng, &c, &NegotiabilityFloor::Universal);
             assert!(
                 validate(&p).is_ok(),
                 "seed {seed} produced invalid profile: {:?}",
@@ -446,6 +537,15 @@ mod tests {
             );
             assert!(p.supported_groups.contains(&GROUP_X25519));
             assert!(p.key_share_curves.contains(&GROUP_X25519));
+            // Negotiability floor: a real server cert (RSA or ECDSA-P256) can
+            // always be verified — no random subset drops the core sig algs.
+            for &a in negotiable_sig_algs() {
+                assert!(
+                    p.signature_algorithms.contains(&a),
+                    "seed {seed}: sig_algs {:04x?} missing negotiable floor {a:#06x}",
+                    p.signature_algorithms
+                );
+            }
             distinct.insert((
                 p.cipher_suites.clone(),
                 p.supported_groups.clone(),
@@ -457,6 +557,66 @@ mod tests {
             "synthesis not varied enough: only {} distinct profiles",
             distinct.len()
         );
+    }
+
+    #[test]
+    fn ensure_negotiable_sig_algs_restores_missing_floor() {
+        // A subset that dropped the whole floor gets it prepended (preferred),
+        // with the original entries preserved after it.
+        let out = ensure_negotiable_sig_algs(vec![0x0807, 0x0908]);
+        for &a in negotiable_sig_algs() {
+            assert!(out.contains(&a), "missing {a:#06x} in {out:04x?}");
+        }
+        assert!(out.ends_with(&[0x0807, 0x0908]));
+        // An already-complete list is returned unchanged (order preserved).
+        let full = vec![0x0403, 0x0804, 0x0401, 0x0503];
+        assert_eq!(ensure_negotiable_sig_algs(full.clone()), full);
+        // A partially-missing list only gains the missing member.
+        let partial = ensure_negotiable_sig_algs(vec![0x0804, 0x0501]);
+        assert_eq!(partial, vec![0x0401, 0x0403, 0x0804, 0x0501]);
+    }
+
+    #[test]
+    fn floor_preset_family_keeps_a_real_browser_sig_alg_list() {
+        use rand_core::SeedableRng;
+        let c = Constraints::recombine();
+        for seed in 0u64..64 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&seed.to_le_bytes());
+            let mut rng = rand_chacha::ChaCha20Rng::from_seed(bytes);
+            let p = synthesize(&mut rng, &c, &NegotiabilityFloor::PresetFamily);
+            // PresetFamily leaves sig_algs exactly as the chosen base preset's —
+            // negotiable AND browser-plausible (no synthetic sig-alg shape).
+            assert!(
+                c.bases
+                    .iter()
+                    .any(|b| b.signature_algorithms == p.signature_algorithms),
+                "seed {seed}: PresetFamily sig_algs {:04x?} matches no base preset",
+                p.signature_algorithms
+            );
+            assert!(validate(&p).is_ok());
+        }
+    }
+
+    #[test]
+    fn floor_custom_guarantees_the_required_set() {
+        use rand_core::SeedableRng;
+        let c = Constraints::recombine();
+        let required = vec![0x0804u16, 0x0403];
+        for seed in 0u64..64 {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&seed.to_le_bytes());
+            let mut rng = rand_chacha::ChaCha20Rng::from_seed(bytes);
+            let p = synthesize(&mut rng, &c, &NegotiabilityFloor::Custom(required.clone()));
+            for &a in &required {
+                assert!(
+                    p.signature_algorithms.contains(&a),
+                    "seed {seed}: Custom floor missing {a:#06x} in {:04x?}",
+                    p.signature_algorithms
+                );
+            }
+            assert!(validate(&p).is_ok());
+        }
     }
 
     /// Stronger than `validate`: synthesized profiles must actually serialize
@@ -471,7 +631,7 @@ mod tests {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             let mut rng = rand_chacha::ChaCha20Rng::from_seed(bytes);
-            let p = synthesize(&mut rng, &c);
+            let p = synthesize(&mut rng, &c, &NegotiabilityFloor::Universal);
             let out = ClientHelloBuilder::new(&p, "example.com").build();
             assert!(
                 out.is_ok(),
@@ -488,7 +648,8 @@ mod tests {
         let c = Constraints::recombine();
         let build = || {
             let mut rng = rand_chacha::ChaCha20Rng::from_seed([9u8; 32]);
-            serde_json::to_string(&synthesize(&mut rng, &c)).unwrap()
+            serde_json::to_string(&synthesize(&mut rng, &c, &NegotiabilityFloor::Universal))
+                .unwrap()
         };
         assert_eq!(
             build(),
@@ -507,7 +668,7 @@ mod tests {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&seed.to_le_bytes());
             let mut rng = rand_chacha::ChaCha20Rng::from_seed(bytes);
-            let p = synthesize(&mut rng, &c);
+            let p = synthesize(&mut rng, &c, &NegotiabilityFloor::Universal);
             for &g in &p.key_share_curves {
                 assert!(
                     KxGroup::from_code_point(g).is_some(),

@@ -121,6 +121,11 @@ bitflags::bitflags! {
     }
 }
 
+/// The signature-algorithm negotiability floor for synthesized fingerprints
+/// (re-exported from `lktls`). See [`Randomize::negotiability`].
+#[cfg(feature = "synthetic-fp")]
+pub use lktls::profile::synthesis::NegotiabilityFloor;
+
 /// A fingerprint randomization policy.
 ///
 /// Build one with a named tier constructor ([`Randomize::off`],
@@ -129,6 +134,9 @@ bitflags::bitflags! {
 #[derive(Clone, Debug)]
 pub struct Randomize {
     mode: RandomizeMode,
+    /// Negotiability floor applied to synthesized identities (recombine/full).
+    #[cfg(feature = "synthetic-fp")]
+    floor: NegotiabilityFloor,
 }
 
 impl Randomize {
@@ -137,6 +145,8 @@ impl Randomize {
     pub fn off() -> Self {
         Self {
             mode: RandomizeMode::Off,
+            #[cfg(feature = "synthetic-fp")]
+            floor: NegotiabilityFloor::Universal,
         }
     }
 
@@ -150,6 +160,8 @@ impl Randomize {
     pub fn extension_order() -> Self {
         Self {
             mode: RandomizeMode::ExtensionOrder,
+            #[cfg(feature = "synthetic-fp")]
+            floor: NegotiabilityFloor::Universal,
         }
     }
 
@@ -188,6 +200,7 @@ impl Randomize {
     pub fn recombine_layers(layers: Layers) -> Self {
         Self {
             mode: RandomizeMode::Recombine(layers),
+            floor: NegotiabilityFloor::Universal,
         }
     }
 
@@ -217,7 +230,29 @@ impl Randomize {
     pub fn full_layers(layers: Layers) -> Self {
         Self {
             mode: RandomizeMode::Full(layers),
+            floor: NegotiabilityFloor::Universal,
         }
+    }
+
+    /// Set the [`NegotiabilityFloor`] for synthesized identities (recombine /
+    /// full). No-op for `off` / `extension_order`. Defaults to
+    /// [`NegotiabilityFloor::Universal`].
+    ///
+    /// ```rust
+    /// use lkrequest::{Randomize, NegotiabilityFloor};
+    /// // Stay browser-plausible (keep the base preset's real sig algs):
+    /// let p = Randomize::recombine().negotiability(NegotiabilityFloor::PresetFamily);
+    /// ```
+    #[cfg(feature = "synthetic-fp")]
+    pub fn negotiability(mut self, floor: NegotiabilityFloor) -> Self {
+        self.floor = floor;
+        self
+    }
+
+    /// The configured negotiability floor.
+    #[cfg(feature = "synthetic-fp")]
+    pub(crate) fn floor(&self) -> &NegotiabilityFloor {
+        &self.floor
     }
 
     pub(crate) fn mode(&self) -> RandomizeMode {
@@ -257,8 +292,11 @@ pub struct FingerprintIdentity {
 /// single reproducible draw (same seed ⇒ identical identity). Each layer's
 /// output is capability-safe and passes its own `validate` by construction.
 #[cfg(feature = "synthetic-fp")]
-pub fn resolve_recombine_identity(seed: [u8; 32]) -> FingerprintIdentity {
-    resolve_identity(seed, Degree::Recombine)
+pub fn resolve_recombine_identity(
+    seed: [u8; 32],
+    floor: &NegotiabilityFloor,
+) -> FingerprintIdentity {
+    resolve_identity(seed, Degree::Recombine, floor)
 }
 
 /// Resolve a per-session [`FingerprintIdentity`] at the **Full** (Tier 3b)
@@ -267,8 +305,8 @@ pub fn resolve_recombine_identity(seed: [u8; 32]) -> FingerprintIdentity {
 /// The TLS layer is identical to [`resolve_recombine_identity`] — see
 /// [`Randomize::full`] for why TLS has no wider degree.
 #[cfg(feature = "synthetic-fp")]
-pub fn resolve_full_identity(seed: [u8; 32]) -> FingerprintIdentity {
-    resolve_identity(seed, Degree::Full)
+pub fn resolve_full_identity(seed: [u8; 32], floor: &NegotiabilityFloor) -> FingerprintIdentity {
+    resolve_identity(seed, Degree::Full, floor)
 }
 
 /// Synthesis degree: how far the per-layer synthesizers stray from real values.
@@ -282,7 +320,11 @@ enum Degree {
 }
 
 #[cfg(feature = "synthetic-fp")]
-fn resolve_identity(seed: [u8; 32], degree: Degree) -> FingerprintIdentity {
+fn resolve_identity(
+    seed: [u8; 32],
+    degree: Degree,
+    floor: &NegotiabilityFloor,
+) -> FingerprintIdentity {
     use rand_core::SeedableRng;
     let mut rng = rand_chacha::ChaCha20Rng::from_seed(seed);
     // Fixed RNG consumption order; QUIC drawn last so the TLS and H2 draws are
@@ -290,6 +332,7 @@ fn resolve_identity(seed: [u8; 32], degree: Degree) -> FingerprintIdentity {
     let tls = lktls::profile::synthesis::synthesize(
         &mut rng,
         &lktls::profile::synthesis::Constraints::recombine(),
+        floor,
     );
     let h2c = lkh2::synthesis::H2Constraints::recombine();
     let h2 = match degree {
@@ -345,6 +388,26 @@ mod tests {
 
     #[cfg(feature = "synthetic-fp")]
     #[test]
+    fn negotiability_floor_defaults_universal_and_is_configurable() {
+        // Default across every synthetic constructor.
+        assert_eq!(
+            Randomize::recombine().floor(),
+            &NegotiabilityFloor::Universal
+        );
+        assert_eq!(Randomize::full().floor(), &NegotiabilityFloor::Universal);
+        assert_eq!(
+            Randomize::recombine_layers(Layers::TLS).floor(),
+            &NegotiabilityFloor::Universal
+        );
+        // The builder overrides it and is preserved through the policy.
+        let p = Randomize::recombine().negotiability(NegotiabilityFloor::PresetFamily);
+        assert_eq!(p.floor(), &NegotiabilityFloor::PresetFamily);
+        let c = Randomize::full().negotiability(NegotiabilityFloor::Custom(vec![0x0804]));
+        assert_eq!(c.floor(), &NegotiabilityFloor::Custom(vec![0x0804]));
+    }
+
+    #[cfg(feature = "synthetic-fp")]
+    #[test]
     fn full_selects_tier3b() {
         assert!(matches!(
             Randomize::full().mode(),
@@ -364,7 +427,7 @@ mod tests {
         let mut tls_sigs = std::collections::HashSet::new();
         let mut h2_sigs = std::collections::HashSet::new();
         for s in 0u8..50 {
-            let id = resolve_recombine_identity([s; 32]);
+            let id = resolve_recombine_identity([s; 32], &NegotiabilityFloor::Universal);
             // Both layers valid by their own oracle.
             assert!(
                 lktls::profile::synthesis::validate(&id.tls).is_ok(),
@@ -375,7 +438,7 @@ mod tests {
                 "seed {s}: H2 invalid"
             );
             // Reproducible: same seed → identical identity (both layers).
-            let again = resolve_recombine_identity([s; 32]);
+            let again = resolve_recombine_identity([s; 32], &NegotiabilityFloor::Universal);
             assert_eq!(
                 serde_json::to_string(&id.tls).unwrap(),
                 serde_json::to_string(&again.tls).unwrap()
@@ -406,7 +469,7 @@ mod tests {
     fn full_identity_is_valid_reproducible_and_diverges_from_recombine() {
         let mut diverged = false;
         for s in 0u8..50 {
-            let full = resolve_full_identity([s; 32]);
+            let full = resolve_full_identity([s; 32], &NegotiabilityFloor::Universal);
             assert!(
                 lktls::profile::synthesis::validate(&full.tls).is_ok(),
                 "seed {s}: TLS invalid"
@@ -416,13 +479,13 @@ mod tests {
                 "seed {s}: H2 invalid"
             );
             // Reproducible: same seed → identical H2.
-            let again = resolve_full_identity([s; 32]);
+            let again = resolve_full_identity([s; 32], &NegotiabilityFloor::Universal);
             assert_eq!(
                 serde_json::to_string(&full.h2).unwrap(),
                 serde_json::to_string(&again.h2).unwrap()
             );
             // Full perturbs H2 values, so it generally differs from recombine.
-            let recomb = resolve_recombine_identity([s; 32]);
+            let recomb = resolve_recombine_identity([s; 32], &NegotiabilityFloor::Universal);
             if serde_json::to_string(&full.h2).unwrap()
                 != serde_json::to_string(&recomb.h2).unwrap()
             {
@@ -439,13 +502,15 @@ mod tests {
     fn recombine_identity_quic_layer_is_valid_and_varied() {
         let mut quic_sigs = std::collections::HashSet::new();
         for s in 0u8..50 {
-            let id = resolve_recombine_identity([s; 32]);
+            let id = resolve_recombine_identity([s; 32], &NegotiabilityFloor::Universal);
             let quic = id.quic.expect("quic-h3 build synthesizes a QUIC profile");
             assert!(
                 lkh3::synthesis::validate(&quic).is_ok(),
                 "seed {s}: QUIC invalid"
             );
-            let again = resolve_recombine_identity([s; 32]).quic.unwrap();
+            let again = resolve_recombine_identity([s; 32], &NegotiabilityFloor::Universal)
+                .quic
+                .unwrap();
             assert_eq!(
                 serde_json::to_string(&quic).unwrap(),
                 serde_json::to_string(&again).unwrap()

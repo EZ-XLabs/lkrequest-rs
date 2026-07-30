@@ -20,6 +20,7 @@ available.
 | `chrome_147` | yes | yes | yes | generic Chromium QUIC/H3 |
 | `chrome_148` | yes | yes | yes | generic Chromium QUIC/H3 |
 | `chrome_149` | yes | yes | yes | generic Chromium QUIC/H3 |
+| `chrome_150` | yes | yes | yes | generic Chromium QUIC/H3 |
 
 `capture-chrome` takes any local Chrome/Chromium executable, including Chrome
 for Testing milestone builds. Headless mode can change application-layer

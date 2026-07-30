@@ -9,13 +9,14 @@ lkrequest enables precise simulation of real browser network fingerprints — in
 - **TLS Fingerprint Control** — Byte-level ClientHello generation that matches real browsers (Chrome, Firefox, Safari)
 - **HTTP/2 Fingerprint Control** — SETTINGS frame order, pseudo-header order, WINDOW_UPDATE, PRIORITY frames, and per-request priority weights
 - **HTTP/3 + QUIC** — Optional `quic-h3` feature for full HTTP/3 over QUIC with fingerprint-aware Transport Parameters, Alt-Svc auto-discovery, and H2→H3 seamless upgrade
-- **Built-in Browser Presets** — Chrome 131/144/145/146/147/148/149, Firefox 133/147, Safari 18/26 (TLS + H2, plus QUIC when `quic-h3` is enabled)
+- **Built-in Browser Presets** — Chrome 131/144/145/146/147/148/149/150, Firefox 133/147, Safari 18/26 (TLS + H2, plus QUIC when `quic-h3` is enabled)
+- **Fingerprint Randomization** — Optional `synthetic-fp` feature: per-session *synthetic* fingerprints (extension-order jitter, preset recombination, out-of-corpus perturbation), composable per layer via a `Layers` mask and held to a configurable negotiability floor
 - **Session Management** — Cookie jars, connection pooling, HTTP/2 multiplexing, and optional QUIC 0-RTT session resumption
 - **Connection Prewarming** — `session.preconnect()` pre-establishes DNS + TCP + TLS + H2 (or, with `quic-h3`, QUIC + H3) connections
 - **Custom DNS Resolver** — Pluggable DNS with DoH support, auto ECH config and H3 hints via HTTPS/SVCB records
 - **Alt-Svc Discovery** — Automatic HTTP/2 → HTTP/3 protocol upgrade via Alt-Svc headers with broken-QUIC fallback
 - **SessionPool** — High-concurrency pool with proxy rotation (round-robin / random)
-- **Proxy Support** — SOCKS5 and HTTP CONNECT with authentication
+- **Proxy Support** — SOCKS5 and HTTP CONNECT with authentication, plus multi-hop **proxy chains** (QUIC/H3 supported over an all-SOCKS5 chain)
 - **WebSocket** — HTTP/1.1 Upgrade (RFC 6455) and H2 Extended CONNECT (RFC 8441)
 - **Middleware** — Interceptor chain for request/response modification
 - **Retry Policies** — Exponential backoff, fixed interval, custom strategies
@@ -299,6 +300,27 @@ let session = client.session()
     .build();
 ```
 
+### Proxy Chain (multi-hop)
+
+Route through an ordered chain of proxies (client → hop1 → hop2 → … → target).
+TCP (HTTP/1.1, HTTP/2) works with any mix of HTTP CONNECT and SOCKS5 hops.
+**QUIC/HTTP/3** works over an **all-SOCKS5** chain (nested UDP ASSOCIATE); a chain
+containing an HTTP hop errors for QUIC, so the request falls back to H2.
+
+```rust
+use lkrequest::proxy::ProxyConfig;
+
+// client → hop1 → hop2 → target
+let chain = ProxyConfig::parse_chain([
+    "socks5://user:pass@hop1:1080",
+    "socks5://user:pass@hop2:1080",
+])?;
+
+let session = client.session()
+    .proxy_config(chain)
+    .build();
+```
+
 ### SessionPool with Proxy Rotation
 
 ```rust
@@ -461,10 +483,15 @@ let resp = h3_session.get("https://quic.browserleaks.com/json").send().await?;
 | `chrome_147()` | — | Chrome 147 (Windows) |
 | `chrome_148()` | — | Chrome 148 (Windows) |
 | `chrome_149()` | — | Chrome 149 (Windows) |
+| `chrome_150()` | — | Chrome 150 (Windows) |
 | `firefox_133()` | — | Firefox 133 |
 | `firefox_147()` | — | Firefox 147 |
 | `safari_18()` | — | Safari 18 (macOS) |
 | `safari_26()` | — | Safari 26 (macOS) |
+
+> **Chrome 150** matches Chrome 149 on the wire **except** for one change captured on the TLS/H2 (TCP) ClientHello: it prepends three ML-DSA post-quantum signature code-points (`0x0904`/`0x0905`/`0x0906` = `mldsa44`/`65`/`87`) to `signature_algorithms`. This shifts **JA4** but not **JA3** (JA3 excludes signature algorithms), and requires no PQC crypto since the codepoints are only advertised, never negotiated by real servers.
+>
+> **HTTP/3 is not updated for Chrome 150.** `preset::chrome_150()` still reuses the shared Chrome 146 QUIC/H3 transport profile (as Chrome 144–149 do), so its QUIC ClientHello does **not** yet carry the ML-DSA signature algorithms. A dedicated Chrome 150 H3 capture is pending — the local capture path is blocked by Chrome's QUIC certificate enforcement.
 
 ### Client Presets (TLS + H2 + optional QUIC + Header/Cookie Order)
 

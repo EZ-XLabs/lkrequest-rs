@@ -635,6 +635,15 @@ pub fn chrome_149_h2() -> H2Profile {
     chrome_144_h2()
 }
 
+/// Returns the Chrome 150 H2 fingerprint profile.
+///
+/// Verified identical to Chrome 149 by capturing real Chrome 150.0.7871.47.
+/// Akamai fingerprint: `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`
+/// Akamai hash: `52d84b11737d980aef856699f885ca86`
+pub fn chrome_150_h2() -> H2Profile {
+    chrome_144_h2()
+}
+
 /// Returns the Chrome 131 H2 fingerprint profile.
 ///
 /// Same H2 parameters as Chrome 144 (H2 fingerprint hasn't changed).
@@ -642,12 +651,15 @@ pub fn chrome_131_h2() -> H2Profile {
     chrome_144_h2()
 }
 
-/// Encode H2 SETTINGS as raw bytes for ALPS (Application-Layer Protocol Settings).
+/// Encode H2 SETTINGS as a raw settings payload (without the HTTP/2 frame
+/// header). Each setting is 6 bytes: id(2) + value(4).
 ///
-/// ALPS carries the H2 SETTINGS payload (without the HTTP/2 frame header)
-/// inside the TLS ClientHello. Each setting is 6 bytes: id(2) + value(4).
-///
-/// This matches what Chrome sends in the ALPS extension during the TLS handshake.
+/// NOTE: this is NOT what real Chrome sends as its *client* ALPS payload — a real
+/// Chrome capture shows the client's `application_settings` in the Client
+/// EncryptedExtensions is EMPTY (0 bytes); Chrome sends its actual SETTINGS in the
+/// post-handshake HTTP/2 SETTINGS frame instead. This encoder is used for the
+/// `HTTP2-Settings` upgrade header (see [`encode_h2_settings_base64url`]) and as a
+/// building block; the request path advertises ALPS with an empty client payload.
 pub fn encode_alps_h2_settings(profile: &H2Profile) -> Vec<u8> {
     let mut buf = Vec::with_capacity(profile.settings.len() * 6);
     for setting in &profile.settings {
@@ -1057,6 +1069,13 @@ pub fn chrome_148_header_order() -> Vec<String> {
 ///
 /// Same as Chrome 148 (verified unchanged vs the Chrome 149 capture).
 pub fn chrome_149_header_order() -> Vec<String> {
+    chrome_144_header_order()
+}
+
+/// Returns the Chrome 150 HTTP header sending order.
+///
+/// Same as Chrome 149 (verified unchanged vs the Chrome 150 capture).
+pub fn chrome_150_header_order() -> Vec<String> {
     chrome_144_header_order()
 }
 

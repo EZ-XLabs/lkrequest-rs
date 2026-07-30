@@ -7,6 +7,7 @@ use tracing::Instrument;
 use crate::error::{Error, ProxyErrorKind, Result};
 
 use super::config::{ProxyAuth, ProxyConfig, ProxyScheme};
+use super::socks5_udp::SocksTarget;
 
 impl ProxyConfig {
     /// Establish a TCP connection through this proxy to the given target.
@@ -333,28 +334,25 @@ impl ProxyConfig {
         Ok(stream)
     }
 
-    /// Establish a SOCKS5 UDP ASSOCIATE session through this proxy.
+    /// Establish a SOCKS5 UDP ASSOCIATE session through this proxy (single hop
+    /// or a nested **proxy chain**).
     ///
-    /// Returns the TCP control connection (must be kept alive) and the UDP
-    /// relay address assigned by the proxy. All UDP datagrams must be sent
-    /// to/from this relay address with SOCKS5 UDP framing.
+    /// Returns a [`UdpAssociation`]: one TCP control connection per hop (all
+    /// must be kept alive) and the UDP relay address of each hop. For a single
+    /// hop the returned vecs have length 1 and datagrams are sent to
+    /// `relays[0]` with plain SOCKS5 UDP framing. For a chain, datagrams are
+    /// sent to `relays[0]` (hop1's relay) wrapped in one nested SOCKS5 UDP
+    /// header per subsequent hop — see [`UdpAssociation`] and
+    /// `encode_socks5_udp_nested`.
     pub(crate) async fn udp_associate(
         &self,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
-    ) -> Result<(TcpStream, SocketAddr)> {
-        // UDP ASSOCIATE chaining (nested SOCKS-UDP encapsulation) is not yet
-        // implemented. Fail loudly rather than silently bypass the chain — a
-        // chained QUIC request must fall back to H2 over the TCP chain instead.
+    ) -> Result<UdpAssociation> {
         if !self.chain.is_empty() {
-            return Err(Error::proxy(
-                ProxyErrorKind::ProtocolError,
-                "QUIC over a proxy CHAIN is not supported yet (UDP ASSOCIATE chaining); \
-                 use a single SOCKS5 hop for QUIC, or fall back to H2 over the chain"
-                    .to_string(),
-                None,
-            ));
+            return self.udp_associate_chain(tcp_fingerprint, resolver).await;
         }
+
         let (proxy_host, proxy_port) = self.host_port();
         let proxy_host = proxy_host.to_string();
 
@@ -381,31 +379,133 @@ impl ProxyConfig {
 
             socks5_handshake(&mut stream, self.auth.as_ref()).await?;
 
-            // CMD=0x03 (UDP ASSOCIATE), DST.ADDR = 0.0.0.0:0
-            let udp_req: [u8; 10] = [
-                0x05, // VER
-                0x03, // CMD: UDP ASSOCIATE
-                0x00, // RSV
-                0x01, // ATYP: IPv4
-                0x00, 0x00, 0x00, 0x00, // DST.ADDR: 0.0.0.0
-                0x00, 0x00, // DST.PORT: 0
-            ];
-            stream.write_all(&udp_req).await.map_err(|e| {
-                Error::proxy(
-                    ProxyErrorKind::IoError,
-                    format!("SOCKS5 UDP ASSOCIATE request failed: {e}"),
-                    Some(Box::new(e)),
-                )
-            })?;
+            let raw_relay = send_udp_associate(&mut stream).await?;
+            let first_relay = resolve_first_relay(raw_relay, &stream)?;
 
-            let relay_addr = socks5_read_response(&mut stream, "udp_associate").await?;
-
-            tracing::debug!(relay_addr = %relay_addr, "proxy.udp_associate_established");
-            Ok((stream, relay_addr))
+            tracing::debug!(relay_addr = %first_relay, "proxy.udp_associate_established");
+            Ok(UdpAssociation {
+                control_conns: vec![stream],
+                first_relay,
+                inner_relays: Vec::new(),
+            })
         }
         .instrument(span)
         .await
     }
+
+    /// Establish UDP ASSOCIATE across a multi-hop SOCKS5 **chain** by nesting
+    /// one association per hop.
+    ///
+    /// For a chain `client → hop1 → … → hopN → target`, only hop1 is reachable
+    /// by the client's UDP directly; the inner hops are reached over TCP
+    /// tunnels. UDP ASSOCIATE cannot ride a CONNECT tunnel (CONNECT relays TCP,
+    /// not datagrams), so each hop gets its **own** control connection: hop `i`
+    /// is reached by CONNECT-tunnelling through `hop1..hop_{i-1}` and issuing
+    /// UDP ASSOCIATE there. The resulting relay addresses are later stacked as
+    /// nested per-datagram headers so each hop forwards to the next.
+    ///
+    /// Every hop must be SOCKS5 — UDP ASSOCIATE is a SOCKS5-only command, and an
+    /// HTTP CONNECT hop cannot relay datagrams.
+    async fn udp_associate_chain(
+        &self,
+        tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
+        resolver: &dyn crate::dns::DnsResolver,
+    ) -> Result<UdpAssociation> {
+        // Ordered hops: the upstream chain, then `self` (final hop → target).
+        let hops: Vec<&ProxyConfig> = self.chain.iter().chain(std::iter::once(self)).collect();
+
+        for hop in &hops {
+            if !matches!(hop.scheme, ProxyScheme::Socks5 { .. }) {
+                return Err(Error::proxy(
+                    ProxyErrorKind::ProtocolError,
+                    format!(
+                        "QUIC over a proxy chain requires every hop to be SOCKS5 \
+                         (UDP ASSOCIATE is SOCKS5-only); hop {hop} is not SOCKS5 — \
+                         use a single SOCKS5 hop for QUIC, or fall back to H2 over the chain"
+                    ),
+                    None,
+                ));
+            }
+        }
+
+        let span = tracing::debug_span!("proxy.udp_associate.chain", hops = hops.len());
+
+        async move {
+            let mut control_conns = Vec::with_capacity(hops.len());
+            let mut first_relay: Option<SocketAddr> = None;
+            let mut inner_relays: Vec<SocksTarget> = Vec::with_capacity(hops.len() - 1);
+
+            for i in 0..hops.len() {
+                // Fresh TCP to hop1 (the only SYN we emit), then CONNECT-tunnel
+                // through hop1..hop_{i-1} to reach hop i's SOCKS listener.
+                let (first_host, first_port) = hops[0].host_port();
+                let mut stream =
+                    connect_tcp_to_proxy(first_host, first_port, tcp_fingerprint, resolver)
+                        .await
+                        .map_err(|e| {
+                            Error::proxy(
+                                ProxyErrorKind::TcpConnectFailed,
+                                format!(
+                                    "failed to connect to first chain hop {first_host}:{first_port} \
+                                     for UDP ASSOCIATE: {e}"
+                                ),
+                                Some(Box::new(e)),
+                            )
+                        })?;
+
+                for j in 0..i {
+                    let (next_host, next_port) = hops[j + 1].host_port();
+                    hops[j]
+                        .negotiate_over(&mut stream, next_host, next_port, resolver)
+                        .await?;
+                }
+
+                // At hop i: SOCKS5 handshake + UDP ASSOCIATE over the tunnel.
+                socks5_handshake(&mut stream, hops[i].auth.as_ref()).await?;
+                let raw_relay = send_udp_associate(&mut stream).await?;
+
+                if i == 0 {
+                    let relay = resolve_first_relay(raw_relay, &stream)?;
+                    tracing::debug!(hop = 0, relay = %relay, "proxy.udp_associate.chain.hop_established");
+                    first_relay = Some(relay);
+                } else {
+                    let relay = resolve_inner_relay(raw_relay, hops[i]);
+                    tracing::debug!(hop = i, relay = %relay, "proxy.udp_associate.chain.hop_established");
+                    inner_relays.push(relay);
+                }
+                control_conns.push(stream);
+            }
+
+            tracing::debug!("proxy.udp_associate.chain.established");
+            Ok(UdpAssociation {
+                control_conns,
+                first_relay: first_relay.expect("a chain always has at least the final hop"),
+                inner_relays,
+            })
+        }
+        .instrument(span)
+        .await
+    }
+}
+
+/// A live SOCKS5 UDP association — a single hop or a nested proxy **chain**.
+///
+/// `control_conns` is ordered hop1..hopN and every entry must be kept alive for
+/// the association's lifetime — dropping one tears down its relay.
+///
+/// `first_relay` is hop1's relay: the only address the client sends UDP
+/// datagrams to directly. `inner_relays` holds `relay2..relayN` — each reachable
+/// only *through* the previous hop, stacked as a nested SOCKS5 UDP header so
+/// that hop forwards the datagram onward. Each inner relay is an IP, or a
+/// **domain** when the hop advertised an unspecified BND (so the previous,
+/// adjacent hop resolves it in its own network context). `inner_relays` is
+/// empty for a single hop.
+pub(crate) struct UdpAssociation {
+    pub control_conns: Vec<TcpStream>,
+    pub first_relay: SocketAddr,
+    // Only consumed by the quic-h3 `Socks5UdpSocket`; write-only without it.
+    #[cfg_attr(not(feature = "quic-h3"), allow(dead_code))]
+    pub inner_relays: Vec<SocksTarget>,
 }
 
 /// SOCKS5 greeting + authentication negotiation (shared by CONNECT and UDP ASSOCIATE).
@@ -693,6 +793,73 @@ async fn socks5_read_response(stream: &mut TcpStream, cmd_name: &str) -> Result<
     };
 
     Ok(bound_addr)
+}
+
+/// Send a SOCKS5 UDP ASSOCIATE command and return the raw BND relay address
+/// from the reply (may be unspecified — see [`substitute_udp_relay`]).
+async fn send_udp_associate(stream: &mut TcpStream) -> Result<SocketAddr> {
+    // CMD=0x03 (UDP ASSOCIATE), DST.ADDR = 0.0.0.0:0 ("I don't know my source
+    // yet"): the relay binds a socket and returns its BND address.
+    let udp_req: [u8; 10] = [
+        0x05, // VER
+        0x03, // CMD: UDP ASSOCIATE
+        0x00, // RSV
+        0x01, // ATYP: IPv4
+        0x00, 0x00, 0x00, 0x00, // DST.ADDR: 0.0.0.0
+        0x00, 0x00, // DST.PORT: 0
+    ];
+    stream.write_all(&udp_req).await.map_err(|e| {
+        Error::proxy(
+            ProxyErrorKind::IoError,
+            format!("SOCKS5 UDP ASSOCIATE request failed: {e}"),
+            Some(Box::new(e)),
+        )
+    })?;
+    socks5_read_response(stream, "udp_associate").await
+}
+
+/// Resolve hop1's (directly connected) relay BND to a concrete address that the
+/// client sends datagrams to. An unspecified BND (`0.0.0.0:<port>`, meaning
+/// "reach me on whatever address you connected on") becomes the control
+/// connection's peer IP with the advertised port. A concrete BND is used as-is.
+fn resolve_first_relay(raw: SocketAddr, control_conn: &TcpStream) -> Result<SocketAddr> {
+    if !raw.ip().is_unspecified() {
+        return Ok(raw);
+    }
+    let ip = control_conn
+        .peer_addr()
+        .map_err(|e| {
+            Error::proxy(
+                ProxyErrorKind::IoError,
+                format!("failed to read proxy peer address for UDP relay: {e}"),
+                Some(Box::new(e)),
+            )
+        })?
+        .ip();
+    Ok(SocketAddr::new(ip, raw.port()))
+}
+
+/// Resolve an inner chain hop's relay BND to a nested-header DST.
+///
+/// A concrete BND is used as-is — the relay told us a reachable address. An
+/// unspecified BND ("reach me on whatever address you connected on") is
+/// addressed by the hop's *own configured host*: a **domain** is kept as a
+/// domain (ATYP=0x03) so the previous, adjacent hop resolves it in its own
+/// network context — the client can't, because it never reaches this relay
+/// directly and NAT could make a client-side resolution wrong. An IP-literal
+/// host is used directly (there is nothing more the client can infer).
+fn resolve_inner_relay(raw: SocketAddr, hop: &ProxyConfig) -> SocksTarget {
+    if !raw.ip().is_unspecified() {
+        return SocksTarget::Ip(raw);
+    }
+    let (host, _port) = hop.host_port();
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => SocksTarget::Ip(SocketAddr::new(ip, raw.port())),
+        Err(_) => SocksTarget::Domain {
+            host: host.to_string(),
+            port: raw.port(),
+        },
+    }
 }
 
 /// TCP connect to a proxy server, mapping errors to proxy-specific types.

@@ -33,10 +33,10 @@ use std::sync::Arc;
 use crate::crypto::aead::AeadAlgorithm;
 use crate::crypto::hkdf::{hkdf_expand_label, hkdf_extract, HkdfAlgorithm, HkdfPrk};
 use crate::crypto::kx::{self, EphemeralKeyPair, KxGroup};
-use crate::error::{Result, TlsError};
+use crate::error::{AlertDescription, Result, TlsError};
 use crate::extensions::pre_shared_key::{self, PskIdentity};
 use crate::extensions::quic_transport_params::{decode_transport_params, QuicTransportParams};
-use crate::handshake::client_hello::ClientHelloBuilder;
+use crate::handshake::client_hello::{ClientHelloBuilder, EchRetryState};
 use crate::handshake::handshake_type;
 use crate::handshake::server_hello::{self, ServerHello};
 use crate::profile::types::{ext_type, ExtensionSource, ExtensionSpec, TlsProfile, TlsVersion};
@@ -53,6 +53,7 @@ use crate::crypto::to_hex;
 ///
 /// Accumulates all handshake messages and provides the current hash value
 /// at any point (used for key derivation at multiple stages).
+#[derive(Clone)]
 struct TranscriptHash {
     context: digest::Context,
     algorithm: HkdfAlgorithm,
@@ -192,6 +193,9 @@ pub struct HandshakeComplete {
     /// The cipher suite negotiated by the server.
     /// Used when storing session tickets for PSK resumption.
     pub negotiated_cipher_suite: u16,
+    /// The server's certificate chain (DER, leaf first), as received in the
+    /// Certificate message. Empty on a resumed (PSK) handshake that sends none.
+    pub server_certificates: Vec<Vec<u8>>,
 
     /// ECH retry configs received from the server in EncryptedExtensions.
     ///
@@ -286,6 +290,10 @@ pub struct Tls13Handshake {
     hrr_received: bool,
     /// GREASE values from the first ClientHello, reused in CH2 after HRR.
     grease_values: Option<crate::extensions::grease::GreaseValues>,
+    /// Exact extension permutation selected for CH1.
+    extension_order: Option<Vec<ExtensionSpec>>,
+    /// Complete fake ECH extension from CH1, reused byte-for-byte in CH2.
+    ech_grease_extension: Option<Vec<u8>>,
 
     // --- Negotiated parameters ---
     /// Selected cipher suite.
@@ -351,6 +359,12 @@ pub struct Tls13Handshake {
     /// transcript switching when ECH is accepted.
     ech_inner_hello: Option<Vec<u8>>,
 
+    /// Real-ECH HPKE state retained for CH2 after HRR.
+    ech_retry_state: Option<EchRetryState>,
+
+    /// ECH acceptance signalled by HRR, when an HRR was received.
+    ech_hrr_accepted: Option<bool>,
+
     /// Raw HRR message bytes, preserved for ECH+HRR transcript reconstruction.
     hrr_raw_bytes: Option<Vec<u8>>,
 
@@ -395,6 +409,8 @@ impl Tls13Handshake {
             session_id: None,
             hrr_received: false,
             grease_values: None,
+            extension_order: None,
+            ech_grease_extension: None,
             cipher_suite: None,
             hkdf_algorithm: None,
             aead_algorithm: None,
@@ -415,6 +431,8 @@ impl Tls13Handshake {
             ech_offered: false,
             ech_accepted: false,
             ech_inner_hello: None,
+            ech_retry_state: None,
+            ech_hrr_accepted: None,
             hrr_raw_bytes: None,
             hrr_inner_ch2: None,
             verification_policy: VerificationPolicy::default(),
@@ -430,6 +448,11 @@ impl Tls13Handshake {
     /// Returns the current handshake state.
     pub fn state(&self) -> Tls13State {
         self.state
+    }
+
+    /// Returns whether this handshake has processed a HelloRetryRequest.
+    pub(crate) fn has_received_hrr(&self) -> bool {
+        self.hrr_received
     }
 
     /// Set optional ALPS payload (pre-encoded H2 SETTINGS bytes).
@@ -511,9 +534,12 @@ impl Tls13Handshake {
     ///
     /// This message is sent after receiving the server Finished and before
     /// the client Finished, per draft-vvv-tls-alps. It carries the client's
-    /// application settings (H2 SETTINGS) to the server.
+    /// application settings to the server. Note that real Chrome sends an EMPTY
+    /// client-settings payload here (`Some(vec![])`), so `ext_data_len` is
+    /// commonly 0; a non-empty payload is also supported for other clients.
     ///
-    /// Returns `None` if ALPS was not negotiated by the server.
+    /// Returns `None` if ALPS was not negotiated by the server or no payload was
+    /// configured (`alps_payload == None`).
     fn build_client_encrypted_extensions(&self) -> Option<Vec<u8>> {
         // Only send Client EE if the server negotiated ALPS
         let code_point = self.alps_code_point?;
@@ -580,7 +606,13 @@ impl Tls13Handshake {
             ));
         }
 
-        // Only advertise ALPS in the ClientHello when alps_payload is set.
+        // ALPS advertisement in the ClientHello is DECOUPLED from the client's
+        // settings payload. Real Chrome advertises `application_settings: h2` in
+        // the ClientHello while sending an EMPTY client-settings payload in its
+        // Client EncryptedExtensions (verified against a real Chrome capture). So:
+        //   None        => no ALPS (e.g. the H1-only request path)
+        //   Some(bytes) => advertise ALPS; `bytes` (possibly empty) becomes the
+        //                  Client EncryptedExtensions payload.
         let mut profile_for_ch = self.profile.clone();
         if self.alps_payload.is_none() {
             profile_for_ch.alps_protocols = None;
@@ -631,6 +663,17 @@ impl Tls13Handshake {
         {
             ch_builder = ch_builder.with_early_data();
         }
+        if self.ech_config_list.is_some() {
+            if let Some(ticket) = self.psk_ticket.as_ref() {
+                ch_builder = ch_builder.with_psk_offer(
+                    ticket.ticket.clone(),
+                    ticket.obfuscated_ticket_age(),
+                    ticket.resumption_psk.clone(),
+                    ticket.hkdf_algorithm,
+                    Vec::new(),
+                );
+            }
+        }
         // Pre-calculate PSK extension length so padding accounts for it.
         let psk_extra_len = if let Some(ref ticket) = self.psk_ticket {
             crate::extensions::pre_shared_key::psk_extension_length(
@@ -659,18 +702,29 @@ impl Tls13Handshake {
         self.session_id = Some(session_id);
         self.key_pairs = output.key_shares;
         self.grease_values = Some(output.grease_values);
+        self.extension_order = Some(output.shuffled_extensions);
+        self.ech_grease_extension = output.ech_grease_extension;
 
         // Store ECH state from the build output.
         if output.ech_offered {
             self.ech_offered = true;
             self.ech_inner_hello = output.inner_hello;
+            self.ech_retry_state = output.ech_retry_state;
             tracing::debug!("ECH: real ECH offered in ClientHello");
         }
 
         // If we have a PSK ticket, append the pre_shared_key extension
         let psk_ticket_clone = self.psk_ticket.clone();
         let final_msg = if let Some(ref ticket) = psk_ticket_clone {
-            self.append_psk_extension(output.message, ticket)?
+            if output.ech_offered {
+                self.early_secret_from_psk = Some(pre_shared_key::compute_early_secret(
+                    ticket.hkdf_algorithm,
+                    &ticket.resumption_psk,
+                )?);
+                output.message
+            } else {
+                self.append_psk_extension(output.message, ticket, None)?
+            }
         } else {
             output.message
         };
@@ -691,6 +745,7 @@ impl Tls13Handshake {
         &mut self,
         mut ch_msg: Vec<u8>,
         ticket: &SessionTicketData,
+        transcript_prefix: Option<&TranscriptHash>,
     ) -> Result<Vec<u8>> {
         let hkdf_algo = ticket.hkdf_algorithm;
         let binder_len = hkdf_algo.hash_len();
@@ -760,8 +815,13 @@ impl Tls13Handshake {
         let truncated_ch_len = new_msg_len - binders_sz;
         let truncated_ch = &ch_msg[..truncated_ch_len];
 
-        // Compute transcript hash of truncated ClientHello
-        let transcript_hash = {
+        // For CH2 after HRR, the binder covers the existing
+        // message_hash(CH1) + HRR prefix followed by Truncate(CH2).
+        let transcript_hash = if let Some(prefix) = transcript_prefix {
+            let mut transcript = prefix.clone();
+            transcript.update(truncated_ch);
+            transcript.current_hash()
+        } else {
             use aws_lc_rs::digest;
             let algo = match hkdf_algo {
                 HkdfAlgorithm::Sha256 => &digest::SHA256,
@@ -797,6 +857,25 @@ impl Tls13Handshake {
         );
 
         Ok(ch_msg)
+    }
+
+    fn ech_hrr_psk_transcript_prefix(
+        hkdf_algorithm: HkdfAlgorithm,
+        inner_client_hello: &[u8],
+        hello_retry_request: &[u8],
+    ) -> Vec<u8> {
+        let algorithm = match hkdf_algorithm {
+            HkdfAlgorithm::Sha256 => &digest::SHA256,
+            HkdfAlgorithm::Sha384 => &digest::SHA384,
+        };
+        let client_hello_hash = digest::digest(algorithm, inner_client_hello);
+        let mut prefix =
+            Vec::with_capacity(4 + client_hello_hash.as_ref().len() + hello_retry_request.len());
+        prefix.push(handshake_type::MESSAGE_HASH);
+        prefix.extend_from_slice(&[0, 0, client_hello_hash.as_ref().len() as u8]);
+        prefix.extend_from_slice(client_hello_hash.as_ref());
+        prefix.extend_from_slice(hello_retry_request);
+        prefix
     }
 
     // =======================================================================
@@ -995,20 +1074,23 @@ impl Tls13Handshake {
         // Perform ECDH key exchange
         let shared_secret = self.compute_shared_secret(&sh)?;
 
-        // --- ECH acceptance detection (draft-ietf-tls-esni-24, Section 7.2) ---
+        // --- ECH acceptance detection (RFC 9849 Section 7.2) ---
         //
         // If real ECH was offered, check if the server accepted it by
         // verifying that ServerHello.random[24..32] matches the ECH
         // accept_confirmation computed with the inner CH transcript.
         if self.ech_offered {
             if let Some(ref inner_hello) = self.ech_inner_hello {
-                let accepted = self.check_ech_acceptance(
-                    hkdf_algo,
-                    &shared_secret,
-                    inner_hello,
-                    full_msg,
-                    &sh.random,
-                )?;
+                let accepted =
+                    self.check_ech_acceptance(hkdf_algo, inner_hello, full_msg, &sh.random)?;
+
+                if let Some(hrr_accepted) = self.ech_hrr_accepted {
+                    if accepted != hrr_accepted {
+                        return Err(TlsError::HandshakeFailure(
+                            "server changed ECH acceptance across HelloRetryRequest".to_string(),
+                        ));
+                    }
+                }
 
                 if accepted {
                     self.ech_accepted = true;
@@ -1065,10 +1147,54 @@ impl Tls13Handshake {
         hkdf_algo: HkdfAlgorithm,
     ) -> Result<HandshakeAction> {
         if self.hrr_received {
-            return Err(TlsError::HandshakeFailure(
-                "received second HelloRetryRequest".to_string(),
+            return Err(TlsError::local_alert(
+                AlertDescription::UnexpectedMessage,
+                "received second HelloRetryRequest",
             ));
         }
+
+        if sh.legacy_version != 0x0303 {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                format!(
+                    "HRR legacy_version must be 0x0303, got 0x{:04x}",
+                    sh.legacy_version
+                ),
+            ));
+        }
+        if sh.extensions.supported_version != Some(0x0304) {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "HRR must contain supported_versions selecting TLS 1.3",
+            ));
+        }
+
+        if self.ech_offered {
+            let accepted = if let Some(expected) = sh.extensions.ech_confirmation {
+                let inner_hello = self.ech_inner_hello.as_deref().ok_or_else(|| {
+                    TlsError::local_alert(
+                        AlertDescription::InternalError,
+                        "real ECH was offered without a saved inner ClientHello",
+                    )
+                })?;
+                if !self.check_ech_hrr_acceptance(hkdf_algo, inner_hello, full_msg, &expected)? {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::IllegalParameter,
+                        "ECH HRR accept confirmation mismatch",
+                    ));
+                }
+                true
+            } else {
+                false
+            };
+            self.ech_hrr_accepted = Some(accepted);
+        } else if sh.extensions.ech_confirmation.is_some() {
+            return Err(TlsError::local_alert(
+                AlertDescription::UnsupportedExtension,
+                "server sent ECH HRR confirmation without a real ECH offer",
+            ));
+        }
+
         self.hrr_received = true;
         self.hrr_raw_bytes = Some(full_msg.to_vec());
         tracing::debug!(
@@ -1088,23 +1214,50 @@ impl Tls13Handshake {
         transcript.update(full_msg);
         self.transcript = Some(transcript);
 
-        // Determine the group the server wants
-        let required_group = sh.extensions.selected_group.ok_or_else(|| {
-            TlsError::HandshakeFailure("HRR missing selected_group in key_share".to_string())
-        })?;
-        let kx_group = KxGroup::from_code_point(required_group).ok_or_else(|| {
-            TlsError::HandshakeFailure(format!(
-                "HRR requested unsupported group: 0x{required_group:04x}"
-            ))
-        })?;
+        let replace_key_share = if let Some(required_group) = sh.extensions.selected_group {
+            if !self.profile.supported_groups.contains(&required_group) {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!(
+                        "HRR requested group not offered in supported_groups: 0x{required_group:04x}"
+                    ),
+                ));
+            }
+            if self
+                .key_pairs
+                .iter()
+                .any(|key_pair| key_pair.group.code_point() == required_group)
+            {
+                return Err(TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!(
+                        "HRR requested group already present in CH1 key_share: 0x{required_group:04x}"
+                    ),
+                ));
+            }
 
-        // Generate new key pair for the requested group
-        let new_kp = kx::generate_key_pair(kx_group)?;
-        self.key_pairs = vec![new_kp];
+            let kx_group = KxGroup::from_code_point(required_group).ok_or_else(|| {
+                TlsError::local_alert(
+                    AlertDescription::IllegalParameter,
+                    format!("HRR requested unsupported group: 0x{required_group:04x}"),
+                )
+            })?;
+            self.key_pairs = vec![kx::generate_key_pair(kx_group)?];
+            true
+        } else {
+            false
+        };
+
+        if !replace_key_share && sh.extensions.cookie.is_none() {
+            return Err(TlsError::local_alert(
+                AlertDescription::IllegalParameter,
+                "HRR would not change the second ClientHello",
+            ));
+        }
 
         // Build CH2: use the original random and session_id, with new key_share
         // and optional cookie from HRR.
-        let ch2 = self.build_client_hello_retry(&sh.extensions.cookie)?;
+        let ch2 = self.build_client_hello_retry(&sh.extensions.cookie, replace_key_share)?;
 
         // Feed CH2 into transcript
         if let Some(ref mut transcript) = self.transcript {
@@ -1120,7 +1273,11 @@ impl Tls13Handshake {
     ///
     /// Preserves the original random and session_id, but replaces key_share
     /// with the newly generated key pair and adds cookie if provided.
-    fn build_client_hello_retry(&mut self, cookie: &Option<Vec<u8>>) -> Result<Vec<u8>> {
+    fn build_client_hello_retry(
+        &mut self,
+        cookie: &Option<Vec<u8>>,
+        replace_key_share: bool,
+    ) -> Result<Vec<u8>> {
         let random = self.client_random.ok_or_else(|| {
             TlsError::HandshakeFailure("missing client_random for HRR".to_string())
         })?;
@@ -1130,6 +1287,8 @@ impl Tls13Handshake {
             .ok_or_else(|| TlsError::HandshakeFailure("missing session_id for HRR".to_string()))?;
 
         let mut profile_for_ch = self.profile.clone();
+        // Same ALPS gate as the initial ClientHello: only `None` suppresses ALPS;
+        // `Some(empty)` still advertises it (Chrome sends empty client settings).
         if self.alps_payload.is_none() {
             profile_for_ch.alps_protocols = None;
         }
@@ -1168,8 +1327,17 @@ impl Tls13Handshake {
         if let Some(ref grease) = self.grease_values {
             builder = builder.with_grease_values(grease.clone());
         }
+        if let Some(ref extension_order) = self.extension_order {
+            builder = builder.with_extension_order(extension_order.clone());
+        }
+        if let Some(ref ech_grease_extension) = self.ech_grease_extension {
+            builder = builder.with_ech_grease_extension(ech_grease_extension.clone());
+        }
         if let Some(ref ech_config) = self.ech_config_list {
             builder = builder.with_ech_config(ech_config.clone());
+        }
+        if let Some(ref ticket_data) = self.tls12_session_ticket_data {
+            builder = builder.with_session_ticket_data(ticket_data.clone());
         }
         if let Some(ref params) = self.quic_transport_parameters {
             builder = builder.with_quic_transport_parameters(params.clone());
@@ -1177,16 +1345,60 @@ impl Tls13Handshake {
         if let Some(ref cookie_data) = cookie {
             builder = builder.with_cookie(cookie_data.clone());
         }
+        if self.ech_retry_state.is_some() {
+            if let Some(ticket) = self.psk_ticket.as_ref() {
+                let inner_client_hello = self.ech_inner_hello.as_deref().ok_or_else(|| {
+                    TlsError::HandshakeFailure(
+                        "missing ClientHelloInner1 for ECH PSK HRR".to_string(),
+                    )
+                })?;
+                let hello_retry_request = self.hrr_raw_bytes.as_deref().ok_or_else(|| {
+                    TlsError::HandshakeFailure(
+                        "missing HelloRetryRequest for ECH PSK binder".to_string(),
+                    )
+                })?;
+                let transcript_prefix = Self::ech_hrr_psk_transcript_prefix(
+                    ticket.hkdf_algorithm,
+                    inner_client_hello,
+                    hello_retry_request,
+                );
+                builder = builder.with_psk_offer(
+                    ticket.ticket.clone(),
+                    ticket.obfuscated_ticket_age(),
+                    ticket.resumption_psk.clone(),
+                    ticket.hkdf_algorithm,
+                    transcript_prefix,
+                );
+            }
+        }
 
-        // Override key_share curves to use only the HRR-requested group
-        let output = builder.build_with_key_pairs(&self.key_pairs)?;
+        let output = if replace_key_share {
+            builder.build_retry_with_key_pairs(&self.key_pairs, self.ech_retry_state.as_mut())?
+        } else {
+            builder
+                .build_cookie_retry_with_key_pairs(&self.key_pairs, self.ech_retry_state.as_mut())?
+        };
 
-        // Preserve the inner CH2 for ECH+HRR transcript reconstruction.
-        if output.ech_offered {
+        let ech_offered = output.ech_offered;
+        if ech_offered {
             self.hrr_inner_ch2 = output.inner_hello;
         }
 
-        Ok(output.message)
+        let mut final_message = output.message;
+        if let Some(ticket) = self.psk_ticket.clone() {
+            if ech_offered {
+                self.early_secret_from_psk = Some(pre_shared_key::compute_early_secret(
+                    ticket.hkdf_algorithm,
+                    &ticket.resumption_psk,
+                )?);
+            } else {
+                let transcript_prefix = self.transcript.clone();
+                final_message =
+                    self.append_psk_extension(final_message, &ticket, transcript_prefix.as_ref())?;
+            }
+        }
+
+        Ok(final_message)
     }
 
     // =======================================================================
@@ -1611,6 +1823,7 @@ impl Tls13Handshake {
             negotiated_alpn: self.negotiated_alpn.clone(),
             resumption_master_secret,
             negotiated_cipher_suite: self.cipher_suite.unwrap_or(0x1301),
+            server_certificates: self.server_certificates.clone(),
             ech_retry_configs: self.ech_retry_configs.clone(),
             ech_accepted: self.ech_accepted,
             peer_quic_transport_params: self.peer_quic_transport_params.clone(),
@@ -1625,31 +1838,32 @@ impl Tls13Handshake {
     /// Check if the server accepted ECH by computing the accept_confirmation
     /// and comparing with ServerHello.random[24..32].
     ///
-    /// Per draft-ietf-tls-esni-24 Section 7.2:
+    /// Per RFC 9849 Section 7.2:
     ///
     /// ```text
-    /// accept_confirmation = Derive-Secret(
-    ///     Handshake Secret,
+    /// accept_confirmation = HKDF-Expand-Label(
+    ///     HKDF-Extract(0, ClientHelloInner.random),
     ///     "ech accept confirmation",
-    ///     ClientHelloInner...ServerHello
-    /// )[0..8]
+    ///     Transcript-Hash(ClientHelloInner...ServerHello'),
+    ///     8)
     /// ```
     ///
-    /// where the transcript uses ClientHelloInner instead of ClientHelloOuter,
-    /// and the ServerHello.random is modified: bytes [24..32] are replaced with
-    /// zeros before hashing.
+    /// where ServerHello' is ServerHello with random[24..32] zeroed before
+    /// hashing. The secret is `HKDF-Extract(salt=0, IKM=ClientHelloInner.random)`
+    /// — it is NOT the handshake secret and is independent of the ECDH/PSK
+    /// secrets. The output is exactly 8 bytes (length 8 is encoded into the
+    /// HKDF label, so this is not `derive_secret()[..8]`).
     fn check_ech_acceptance(
         &self,
         hkdf_algo: HkdfAlgorithm,
-        shared_secret: &[u8],
         inner_hello: &[u8],
         server_hello_msg: &[u8],
         server_random: &[u8; 32],
     ) -> Result<bool> {
         let hash_len = hkdf_algo.hash_len();
 
-        // Build a trial transcript: InnerCH + modified ServerHello.
-        // The modified ServerHello has random[24..32] replaced with zeros.
+        // Build the RFC 9849 trial transcript. With HRR this is
+        // message_hash(InnerCH1) + HRR + InnerCH2 + modified ServerHello.
         let mut modified_sh = server_hello_msg.to_vec();
         // ServerHello body starts at offset 4 (handshake header).
         // In the body: version(2) + random(32).
@@ -1661,31 +1875,36 @@ impl Tls13Handshake {
 
         let mut trial_transcript = TranscriptHash::new(hkdf_algo);
         trial_transcript.update(inner_hello);
+        if self.hrr_received {
+            trial_transcript.replace_with_message_hash();
+            let hrr = self.hrr_raw_bytes.as_deref().ok_or_else(|| {
+                TlsError::HandshakeFailure("missing HRR transcript bytes for ECH".to_string())
+            })?;
+            let inner_ch2 = self.hrr_inner_ch2.as_deref().ok_or_else(|| {
+                TlsError::HandshakeFailure("missing inner CH2 transcript bytes for ECH".to_string())
+            })?;
+            trial_transcript.update(hrr);
+            trial_transcript.update(inner_ch2);
+        }
         trial_transcript.update(&modified_sh);
         let transcript_hash = trial_transcript.current_hash();
 
-        // Derive the trial handshake secret using the same key schedule.
-        // When PSK is accepted, the early secret must be derived from the PSK
-        // (matching what the server computes), not from zero IKM.
-        let early_secret = if self.psk_accepted {
-            if let Some(ref ticket) = self.psk_ticket {
-                let zero_salt = vec![0u8; hash_len];
-                hkdf_extract(hkdf_algo, &zero_salt, &ticket.resumption_psk)?
-            } else {
-                let zero_salt = vec![0u8; hash_len];
-                let zero_ikm = vec![0u8; hash_len];
-                hkdf_extract(hkdf_algo, &zero_salt, &zero_ikm)?
-            }
-        } else {
-            let zero_salt = vec![0u8; hash_len];
-            let zero_ikm = vec![0u8; hash_len];
-            hkdf_extract(hkdf_algo, &zero_salt, &zero_ikm)?
-        };
-        let handshake_secret = early_secret.derive_next(shared_secret)?;
+        // Per RFC 9849 §7.2, the confirmation secret is
+        //   HKDF-Extract(salt=0, IKM=ClientHelloInner.random)
+        // — NOT the handshake secret, and independent of the ECDH shared secret
+        // and any PSK. ClientHelloInner.random is bytes [6..38] of the inner
+        // handshake message (type(1) + length(3) + legacy_version(2) + random(32)).
+        if inner_hello.len() < 38 {
+            return Ok(false);
+        }
+        let inner_random = &inner_hello[6..38];
+        let zero_salt = vec![0u8; hash_len];
+        let ech_secret = hkdf_extract(hkdf_algo, &zero_salt, inner_random)?;
 
-        // Compute accept_confirmation.
+        // Output is exactly 8 bytes via HKDF-Expand-Label (length 8 encoded in
+        // the label), not derive_secret()[..8].
         let accept_conf =
-            handshake_secret.derive_secret("ech accept confirmation", &transcript_hash)?;
+            ech_secret.expand_label("ech accept confirmation", &transcript_hash, 8)?;
 
         // Compare first 8 bytes with ServerHello.random[24..32].
         let expected = &server_random[24..32];
@@ -1702,6 +1921,77 @@ impl Tls13Handshake {
             );
             Ok(false)
         }
+    }
+
+    fn check_ech_hrr_acceptance(
+        &self,
+        hkdf_algo: HkdfAlgorithm,
+        inner_hello: &[u8],
+        hrr_msg: &[u8],
+        expected: &[u8; 8],
+    ) -> Result<bool> {
+        if inner_hello.len() < 38 {
+            return Ok(false);
+        }
+
+        let mut modified_hrr = hrr_msg.to_vec();
+        Self::zero_hrr_ech_confirmation(&mut modified_hrr)?;
+        let mut transcript = TranscriptHash::new(hkdf_algo);
+        transcript.update(inner_hello);
+        transcript.update(&modified_hrr);
+
+        let zero_salt = vec![0u8; hkdf_algo.hash_len()];
+        let ech_secret = hkdf_extract(hkdf_algo, &zero_salt, &inner_hello[6..38])?;
+        let confirmation = ech_secret.expand_label(
+            "hrr ech accept confirmation",
+            &transcript.current_hash(),
+            8,
+        )?;
+        Ok(expected.as_slice() == confirmation.as_slice())
+    }
+
+    fn zero_hrr_ech_confirmation(hrr_msg: &mut [u8]) -> Result<()> {
+        if hrr_msg.len() < 4 + 2 + 32 + 1 + 2 + 1 + 2 {
+            return Err(TlsError::HandshakeFailure(
+                "HRR too short for ECH confirmation".to_string(),
+            ));
+        }
+
+        let mut pos = 4 + 2 + 32;
+        let sid_len = hrr_msg[pos] as usize;
+        pos += 1 + sid_len;
+        if pos + 5 > hrr_msg.len() {
+            return Err(TlsError::HandshakeFailure(
+                "malformed HRR before extensions".to_string(),
+            ));
+        }
+        pos += 2 + 1;
+        let ext_len = u16::from_be_bytes([hrr_msg[pos], hrr_msg[pos + 1]]) as usize;
+        pos += 2;
+        let ext_end = pos
+            .checked_add(ext_len)
+            .filter(|end| *end <= hrr_msg.len())
+            .ok_or_else(|| {
+                TlsError::HandshakeFailure("malformed HRR extensions length".to_string())
+            })?;
+
+        while pos + 4 <= ext_end {
+            let extension_type = u16::from_be_bytes([hrr_msg[pos], hrr_msg[pos + 1]]);
+            let extension_len = u16::from_be_bytes([hrr_msg[pos + 2], hrr_msg[pos + 3]]) as usize;
+            pos += 4;
+            if pos + extension_len > ext_end {
+                break;
+            }
+            if extension_type == ext_type::ENCRYPTED_CLIENT_HELLO && extension_len == 8 {
+                hrr_msg[pos..pos + 8].fill(0);
+                return Ok(());
+            }
+            pos += extension_len;
+        }
+
+        Err(TlsError::HandshakeFailure(
+            "HRR ECH confirmation extension not found".to_string(),
+        ))
     }
 
     // =======================================================================
@@ -2009,6 +2299,135 @@ fn parse_certificate_message(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
 mod tests {
     use super::*;
 
+    fn build_hrr(session_id: &[u8], cipher_suite: u16, extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&server_hello::HRR_RANDOM);
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&cipher_suite.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+
+        let mut message = vec![handshake_type::SERVER_HELLO];
+        let body_len = body.len() as u32;
+        message.extend_from_slice(&[
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ]);
+        message.extend_from_slice(&body);
+        message
+    }
+
+    fn client_hello_extension(message: &[u8], target: u16) -> Option<Vec<u8>> {
+        let body = message.get(4..)?;
+        let sid_len = *body.get(34)? as usize;
+        let mut pos = 35 + sid_len;
+        let cipher_len = u16::from_be_bytes([*body.get(pos)?, *body.get(pos + 1)?]) as usize;
+        pos += 2 + cipher_len;
+        let compression_len = *body.get(pos)? as usize;
+        pos += 1 + compression_len;
+        let extensions_len = u16::from_be_bytes([*body.get(pos)?, *body.get(pos + 1)?]) as usize;
+        pos += 2;
+        let extensions_end = pos.checked_add(extensions_len)?;
+        while pos + 4 <= extensions_end {
+            let extension_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+            let extension_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+            pos += 4;
+            let extension_end = pos.checked_add(extension_len)?;
+            if extension_end > extensions_end {
+                return None;
+            }
+            if extension_type == target {
+                return Some(body[pos..extension_end].to_vec());
+            }
+            pos = extension_end;
+        }
+        None
+    }
+
+    fn client_hello_extension_types(message: &[u8]) -> Vec<u16> {
+        let Some(body) = message.get(4..) else {
+            return Vec::new();
+        };
+        let Some(&sid_len) = body.get(34) else {
+            return Vec::new();
+        };
+        let mut pos = 35 + sid_len as usize;
+        let Some(cipher_len_bytes) = body.get(pos..pos + 2) else {
+            return Vec::new();
+        };
+        let cipher_len = u16::from_be_bytes([cipher_len_bytes[0], cipher_len_bytes[1]]) as usize;
+        pos += 2 + cipher_len;
+        let Some(&compression_len) = body.get(pos) else {
+            return Vec::new();
+        };
+        pos += 1 + compression_len as usize;
+        let Some(extensions_len_bytes) = body.get(pos..pos + 2) else {
+            return Vec::new();
+        };
+        let extensions_len =
+            u16::from_be_bytes([extensions_len_bytes[0], extensions_len_bytes[1]]) as usize;
+        pos += 2;
+        let extensions_end = pos.saturating_add(extensions_len).min(body.len());
+        let mut types = Vec::new();
+        while pos + 4 <= extensions_end {
+            let extension_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
+            let extension_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+            pos += 4;
+            let extension_end = pos.saturating_add(extension_len);
+            if extension_end > extensions_end {
+                return Vec::new();
+            }
+            types.push(extension_type);
+            pos = extension_end;
+        }
+        types
+    }
+
+    fn psk_binder(extension_data: &[u8]) -> Vec<u8> {
+        let identities_len = u16::from_be_bytes([extension_data[0], extension_data[1]]) as usize;
+        let binders_len_pos = 2 + identities_len;
+        let binder_len_pos = binders_len_pos + 2;
+        let binder_len = extension_data[binder_len_pos] as usize;
+        extension_data[binder_len_pos + 1..binder_len_pos + 1 + binder_len].to_vec()
+    }
+
+    fn build_test_ech_config_list() -> Vec<u8> {
+        use hpke::kem::X25519HkdfSha256;
+        use hpke::{Kem, Serializable};
+        use rand_core::TryRngCore;
+
+        let (_secret_key, public_key) =
+            X25519HkdfSha256::gen_keypair(&mut rand_core::OsRng.unwrap_err());
+        let public_key = public_key.to_bytes();
+        let mut contents = Vec::new();
+        contents.push(42);
+        contents.extend_from_slice(&0x0020u16.to_be_bytes());
+        contents.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+        contents.extend_from_slice(&public_key);
+        contents.extend_from_slice(&4u16.to_be_bytes());
+        contents.extend_from_slice(&0x0001u16.to_be_bytes());
+        contents.extend_from_slice(&0x0001u16.to_be_bytes());
+        contents.push(32);
+        let public_name = b"public.example.com";
+        contents.push(public_name.len() as u8);
+        contents.extend_from_slice(public_name);
+        contents.extend_from_slice(&0u16.to_be_bytes());
+
+        let mut config = Vec::new();
+        config.extend_from_slice(&0xFE0Du16.to_be_bytes());
+        config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+        config.extend_from_slice(&contents);
+
+        let mut list = Vec::new();
+        list.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        list.extend_from_slice(&config);
+        list
+    }
+
     #[test]
     fn test_cipher_suite_info() {
         let (hkdf, aead) = cipher_suite_info(0x1301).unwrap();
@@ -2051,6 +2470,202 @@ mod tests {
         let hash_after = th.current_hash();
         assert_ne!(hash_before, hash_after);
         assert_eq!(hash_after.len(), 32);
+    }
+
+    #[test]
+    fn test_zero_hrr_ech_confirmation() {
+        let confirmation = [1, 2, 3, 4, 5, 6, 7, 8];
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&server_hello::HRR_RANDOM);
+        body.push(0);
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&12u16.to_be_bytes());
+        body.extend_from_slice(&ext_type::ENCRYPTED_CLIENT_HELLO.to_be_bytes());
+        body.extend_from_slice(&8u16.to_be_bytes());
+        body.extend_from_slice(&confirmation);
+
+        let mut hrr = vec![handshake_type::SERVER_HELLO, 0, 0, body.len() as u8];
+        hrr.extend_from_slice(&body);
+        Tls13Handshake::zero_hrr_ech_confirmation(&mut hrr).unwrap();
+        assert!(hrr.ends_with(&[0u8; 8]));
+    }
+
+    #[test]
+    fn test_cookie_only_hrr_preserves_key_share() {
+        let profile = crate::profile::presets::chrome_150();
+        let cipher_suite = profile.cipher_suites[0];
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        let ch1 = handshake.build_client_hello().unwrap();
+        let session_id = handshake.session_id.clone().unwrap();
+
+        let cookie = b"retry-cookie";
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        extensions.extend_from_slice(&ext_type::COOKIE.to_be_bytes());
+        extensions.extend_from_slice(&((2 + cookie.len()) as u16).to_be_bytes());
+        extensions.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(cookie);
+
+        let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+        let action = handshake.process_handshake_record(&hrr).unwrap();
+        let HandshakeAction::RetryClientHello(ch2) = action else {
+            panic!("expected retry ClientHello");
+        };
+
+        assert_eq!(
+            client_hello_extension(&ch2, ext_type::KEY_SHARE),
+            client_hello_extension(&ch1, ext_type::KEY_SHARE),
+        );
+        assert_eq!(
+            client_hello_extension(&ch2, ext_type::COOKIE),
+            Some([&(cookie.len() as u16).to_be_bytes()[..], cookie].concat()),
+        );
+    }
+
+    #[test]
+    fn test_hrr_rejects_group_already_offered_in_key_share() {
+        let profile = crate::profile::presets::chrome_150();
+        let cipher_suite = profile.cipher_suites[0];
+        let already_offered = profile.key_share_curves[0];
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+        let session_id = handshake.session_id.clone().unwrap();
+
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x02]);
+        extensions.extend_from_slice(&already_offered.to_be_bytes());
+        let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+
+        let error = handshake.process_handshake_record(&hrr).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("already present in CH1 key_share"));
+    }
+
+    #[test]
+    fn test_hrr_rejects_no_requested_change() {
+        let profile = crate::profile::presets::chrome_150();
+        let cipher_suite = profile.cipher_suites[0];
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.build_client_hello().unwrap();
+        let session_id = handshake.session_id.clone().unwrap();
+        let extensions = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+
+        let error = handshake.process_handshake_record(&hrr).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("would not change the second ClientHello"));
+    }
+
+    #[test]
+    fn test_quic_hrr_preserves_transport_parameters_and_empty_session_id() {
+        let mut profile = crate::profile::presets::chrome_150();
+        profile.alpn_protocols = vec!["h3".to_string()];
+        let cipher_suite = profile.cipher_suites[0];
+        let mut handshake = Tls13Handshake::new(profile, "example.com");
+        handshake.enable_quic_mode();
+        handshake.set_quic_transport_parameters(vec![0x01, 0x02, 0x03, 0x04]);
+        let ch1 = handshake.build_client_hello().unwrap();
+        assert_eq!(ch1[38], 0, "QUIC CH1 legacy_session_id must be empty");
+
+        let session_id = handshake.session_id.clone().unwrap();
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x02, 0x00, 0x18]);
+        let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+
+        let action = handshake.process_handshake_record(&hrr).unwrap();
+        let HandshakeAction::RetryClientHello(ch2) = action else {
+            panic!("expected retry ClientHello");
+        };
+        assert_eq!(ch2[38], 0, "QUIC CH2 legacy_session_id must remain empty");
+        assert_eq!(
+            client_hello_extension(&ch2, ext_type::QUIC_TRANSPORT_PARAMETERS),
+            client_hello_extension(&ch1, ext_type::QUIC_TRANSPORT_PARAMETERS),
+        );
+    }
+
+    #[test]
+    fn test_ech_psk_hrr_binders_cover_inner_client_hellos() {
+        use crate::session_store::TicketTlsVersion;
+        use std::time::Instant;
+
+        let profile = crate::profile::presets::chrome_150();
+        let cipher_suite = 0x1301;
+        let resumption_psk = vec![0xA5; 32];
+        let ticket = SessionTicketData {
+            ticket: b"ech-psk-hrr-ticket".to_vec(),
+            resumption_psk: resumption_psk.clone(),
+            tls_version: TicketTlsVersion::Tls13,
+            cipher_suite,
+            lifetime_secs: 3600,
+            age_add: 0x1020_3040,
+            received_at: Instant::now(),
+            alpn: Some("h2".to_string()),
+            hkdf_algorithm: HkdfAlgorithm::Sha256,
+            aead_algorithm: AeadAlgorithm::Aes128Gcm,
+            master_secret: Vec::new(),
+            max_early_data_size: 0,
+            peer_transport_parameters: None,
+        };
+        let mut handshake = Tls13Handshake::new(profile, "secret.example.com");
+        handshake.set_ech_config(build_test_ech_config_list());
+        handshake.set_psk_ticket(ticket);
+
+        let ch1_outer = handshake.build_client_hello().unwrap();
+        let ch1_inner = handshake.ech_inner_hello.clone().expect("ECH inner CH1");
+        assert!(client_hello_extension(&ch1_outer, ext_type::PRE_SHARED_KEY).is_none());
+        assert_eq!(
+            client_hello_extension_types(&ch1_inner).last(),
+            Some(&ext_type::PRE_SHARED_KEY),
+        );
+        let ch1_psk = client_hello_extension(&ch1_inner, ext_type::PRE_SHARED_KEY).unwrap();
+        let ch1_binder = psk_binder(&ch1_psk);
+        let ch1_truncated_len =
+            ch1_inner.len() - pre_shared_key::binders_size(1, HkdfAlgorithm::Sha256.hash_len());
+        let ch1_hash = digest::digest(&digest::SHA256, &ch1_inner[..ch1_truncated_len]);
+        let expected_ch1_binder = pre_shared_key::compute_psk_binder(
+            HkdfAlgorithm::Sha256,
+            &resumption_psk,
+            ch1_hash.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(ch1_binder, expected_ch1_binder);
+
+        let session_id = handshake.session_id.clone().unwrap();
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x02, 0x00, 0x18]);
+        let hrr = build_hrr(&session_id, cipher_suite, &extensions);
+        let action = handshake.process_handshake_record(&hrr).unwrap();
+        let HandshakeAction::RetryClientHello(ch2_outer) = action else {
+            panic!("expected retry ClientHello");
+        };
+        let ch2_inner = handshake.hrr_inner_ch2.clone().expect("ECH inner CH2");
+
+        assert!(client_hello_extension(&ch2_outer, ext_type::PRE_SHARED_KEY).is_none());
+        assert!(client_hello_extension(&ch2_outer, ext_type::EARLY_DATA).is_none());
+        assert!(client_hello_extension(&ch2_inner, ext_type::EARLY_DATA).is_none());
+        assert_eq!(
+            client_hello_extension_types(&ch2_inner).last(),
+            Some(&ext_type::PRE_SHARED_KEY),
+        );
+        let ch2_psk = client_hello_extension(&ch2_inner, ext_type::PRE_SHARED_KEY).unwrap();
+        let ch2_binder = psk_binder(&ch2_psk);
+        let ch2_truncated_len =
+            ch2_inner.len() - pre_shared_key::binders_size(1, HkdfAlgorithm::Sha256.hash_len());
+        let prefix =
+            Tls13Handshake::ech_hrr_psk_transcript_prefix(HkdfAlgorithm::Sha256, &ch1_inner, &hrr);
+        let mut transcript = digest::Context::new(&digest::SHA256);
+        transcript.update(&prefix);
+        transcript.update(&ch2_inner[..ch2_truncated_len]);
+        let expected_ch2_binder = pre_shared_key::compute_psk_binder(
+            HkdfAlgorithm::Sha256,
+            &resumption_psk,
+            transcript.finish().as_ref(),
+        )
+        .unwrap();
+        assert_eq!(ch2_binder, expected_ch2_binder);
     }
 
     #[test]
@@ -2139,6 +2754,42 @@ mod tests {
         let mut hs = Tls13Handshake::new(profile, "example.com");
         hs.set_alps_payload(vec![0x00, 0x03, 0x00, 0x64]);
         assert!(hs.alps_payload.is_some());
+    }
+
+    /// Real Chrome sends a Client EncryptedExtensions carrying `application_settings`
+    /// with an EMPTY payload (verified from a real Chrome 149 capture). Lock that
+    /// exact wire encoding for `Some(vec![])`, and the non-empty case for contrast.
+    #[test]
+    fn client_ee_alps_empty_payload_yields_empty_settings() {
+        let profile = crate::profile::presets::chrome_144();
+        let mut hs = Tls13Handshake::new(profile, "example.com");
+        // Server negotiated ALPS with the new code point.
+        hs.alps_code_point = Some(0x44CD);
+
+        // Empty client settings (Chrome): EE with a 0-length application_settings.
+        hs.alps_payload = Some(Vec::new());
+        assert_eq!(
+            hs.build_client_encrypted_extensions(),
+            // type=0x08, len=0x000006, ext_len=0x0004, ext=0x44CD, data_len=0x0000
+            Some(vec![
+                0x08, 0x00, 0x00, 0x06, 0x00, 0x04, 0x44, 0xCD, 0x00, 0x00
+            ]),
+            "Some(empty) ⇒ Client EE application_settings with 0-length payload"
+        );
+
+        // Non-empty client settings are still supported (2-byte payload here).
+        hs.alps_payload = Some(vec![0xAA, 0xBB]);
+        assert_eq!(
+            hs.build_client_encrypted_extensions(),
+            Some(vec![
+                0x08, 0x00, 0x00, 0x08, 0x00, 0x06, 0x44, 0xCD, 0x00, 0x02, 0xAA, 0xBB
+            ]),
+            "Some(non-empty) ⇒ payload carried in the Client EE"
+        );
+
+        // No payload ⇒ no Client EE at all.
+        hs.alps_payload = None;
+        assert_eq!(hs.build_client_encrypted_extensions(), None);
     }
 
     #[test]

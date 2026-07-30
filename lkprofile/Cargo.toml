@@ -1,6 +1,6 @@
 [package]
 name = "lkprofile"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Parse TLS ClientHello and HTTP/2 frames into fingerprint profiles"
 publish = false

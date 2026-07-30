@@ -2,6 +2,8 @@
 /tools/pcap_diff/target
 /tools/profile_collector/target
 **/target/
+# Local release-build output (e.g. FFI DLLs assembled to mirror CI artifacts)
+/artifacts/
 .DS_Store
 /docs
 /.cursor
@@ -16,3 +18,5 @@
 CLAUDE.md
 /*.log
 /scripts
+# Captured fingerprint output from the peet_ws_fingerprint example (throwaway)
+/tlsleak/

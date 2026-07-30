@@ -9,8 +9,8 @@
 //! - [`H3Profile`] — HTTP/3 `SETTINGS` order, QPACK limits, pseudo-header order
 //!   ([`PseudoHeaderId`]), control-stream GREASE, and RFC 9218 `PRIORITY_UPDATE`
 //!   frames.
-//! - Browser presets: [`chrome_quic`], [`chrome_146_quic`], [`chrome_h3`],
-//!   [`chrome_146_h3`], [`firefox_h3`].
+//! - Browser presets: [`chrome_quic`], [`chrome_146_quic`], [`chrome_150_quic`],
+//!   [`chrome_h3`], [`chrome_146_h3`], [`chrome_150_h3`], [`firefox_h3`].
 //!
 //! The transport itself is the patched `h3` + `h3-quinn` stack: [`connect_h3`]
 //! wraps a live [`quinn`] connection into an [`H3Connection`], and [`H3Sender`]
@@ -31,11 +31,11 @@ pub use connection::{
 };
 pub use h3_quinn::quinn;
 pub use profile::{
-    chrome_146_h3, chrome_146_quic, chrome_h3, chrome_quic, encode_alps_h3_settings, firefox_h3,
-    H3Profile, InitialFrameElement, InitialFrameLayoutProfile, InitialPacketLayoutProfile,
-    PseudoHeaderId, QuicPacketizationProfile, QuicProfile, QuicTransportParams,
-    SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE, SETTINGS_QPACK_BLOCKED_STREAMS,
-    SETTINGS_QPACK_MAX_TABLE_CAPACITY,
+    chrome_146_h3, chrome_146_quic, chrome_150_h3, chrome_150_quic, chrome_h3, chrome_quic,
+    encode_alps_h3_settings, firefox_h3, H3Profile, InitialFrameElement, InitialFrameLayoutProfile,
+    InitialPacketLayoutProfile, PseudoHeaderId, QuicPacketizationProfile, QuicProfile,
+    QuicTransportParams, SETTINGS_H3_DATAGRAM, SETTINGS_MAX_FIELD_SECTION_SIZE,
+    SETTINGS_QPACK_BLOCKED_STREAMS, SETTINGS_QPACK_MAX_TABLE_CAPACITY,
 };
 pub use sender::H3Sender;
 pub use synthesis::{validate as validate_quic_profile, InvalidQuicSpec, QuicConstraints};

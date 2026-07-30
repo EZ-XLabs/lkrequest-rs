@@ -378,6 +378,16 @@ impl RouteKey {
     }
 }
 
+/// Whether `proxy` resolves the target's DNS remotely, meaning the client must
+/// perform **no** local DNS for the target — neither A/AAAA nor HTTPS/SVCB
+/// discovery. Doing so would leak the target hostname out-of-band from the
+/// proxy. Mirrors [`RouteKey::from_proxy`]'s [`DnsResolutionMode`]: HTTP CONNECT
+/// and `socks5h` resolve remotely; a direct route and plain `socks5` resolve
+/// locally.
+pub(crate) fn proxy_uses_remote_dns(proxy: Option<&ProxyConfig>) -> bool {
+    RouteKey::from_proxy(proxy).dns_mode == DnsResolutionMode::Remote
+}
+
 impl fmt::Display for RouteKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let kind = match self.proxy_kind {

@@ -37,6 +37,15 @@ use std::sync::Arc;
 /// Wireshark uses these lines to decrypt captured TLS traffic.
 pub type KeyLogCallback = Arc<dyn Fn(&str) + Send + Sync>;
 
+/// Callback invoked with the ClientHello **handshake message** bytes (the
+/// `0x01`-prefixed handshake, before TLS-record / QUIC-CRYPTO framing) the moment
+/// they are produced — the exact outbound TLS fingerprint, including any
+/// per-connection GREASE/shuffle and the real (outer) ECH ClientHello. The bytes
+/// are directly parseable with `lkprofile::parse_client_hello`. Fired inline by
+/// both the TCP and QUIC handshake drivers, so keep the callback cheap and
+/// non-blocking. Observation/diagnostics only — it cannot alter the handshake.
+pub type ClientHelloCallback = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
 pub mod crypto;
 pub mod ech;
 pub mod error;

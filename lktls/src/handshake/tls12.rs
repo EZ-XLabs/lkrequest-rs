@@ -413,6 +413,12 @@ impl Tls12Handshake {
         self.cipher_suite
     }
 
+    /// The server's certificate chain (DER, leaf first) from the Certificate
+    /// message. Empty on an abbreviated (resumption) handshake.
+    pub fn server_certificates(&self) -> &[Vec<u8>] {
+        &self.server_certificates
+    }
+
     /// Set the master secret from a stored session ticket for resumption.
     ///
     /// When set, the handshake will attempt abbreviated handshake (RFC 5077).

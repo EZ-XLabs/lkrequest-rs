@@ -308,8 +308,22 @@ impl H2Engine {
             continuation.set_max_header_block_size(mhls.value as usize);
         }
 
+        // Our receive/decode frame-size cap is whatever we advertise in our
+        // own SETTINGS (SETTINGS_MAX_FRAME_SIZE, RFC 7540 §4.2). It is fixed
+        // for the connection's lifetime and is NEVER raised by the server's
+        // advertised value — that only bounds the size of frames *we emit*
+        // (see `build_data`/`build_headers`, which read `remote_settings`).
+        let mut codec = H2Codec::new();
+        if let Some(mfs) = profile
+            .settings
+            .iter()
+            .find(|s| s.id == crate::profile::H2SettingId::MaxFrameSize)
+        {
+            codec.set_max_frame_size(mfs.value);
+        }
+
         let engine = Self {
-            codec: H2Codec::new(),
+            codec,
             state,
             pseudo_header_order: profile.pseudo_header_order.clone(),
             continuation,
@@ -769,8 +783,11 @@ impl H2Engine {
                 .set_encoder_table_size(new_header_table_size as usize);
         }
 
-        self.codec
-            .set_max_frame_size(self.state.remote_settings().max_frame_size);
+        // NOTE: the server's SETTINGS_MAX_FRAME_SIZE is intentionally NOT used
+        // to size our receive/decode cap (`self.codec`). Per RFC 7540 §4.2 the
+        // limit on frames the peer may send us is *our* advertised value, fixed
+        // at construction. The remote value only bounds frames we emit, which
+        // `build_data`/`build_headers` read from `remote_settings()` directly.
 
         Self::emit_settings_ack(outbound);
         self.remote_settings_received = true;
@@ -1348,6 +1365,40 @@ mod tests {
         if let H2Frame::Settings(s) = &outbound[0] {
             assert!(s.ack);
         }
+    }
+
+    #[test]
+    fn server_settings_must_not_raise_our_receive_frame_size_limit() {
+        // Our advertised SETTINGS_MAX_FRAME_SIZE bounds how large a frame the
+        // server may send us (RFC 7540 §4.2). A malicious server advertising a
+        // huge MAX_FRAME_SIZE must NOT be able to raise our *decode* limit and
+        // make us buffer ~16 MB single frames.
+        let (mut engine, _) = H2Engine::client(&chrome_144_h2());
+
+        // Baseline: the decode limit starts at our advertised value (16384).
+        assert_eq!(engine.codec.max_frame_size(), 16384);
+
+        let codec = H2Codec::new();
+        let mut server_buf = BytesMut::new();
+        codec.encode(
+            &H2Frame::Settings(SettingsFrame {
+                ack: false,
+                settings: vec![SettingsParameter {
+                    id: 0x05,          // SETTINGS_MAX_FRAME_SIZE
+                    value: 16_777_215, // maximum legal value
+                }],
+            }),
+            &mut server_buf,
+        );
+        let _ = engine.process(&mut server_buf);
+
+        // The receive/decode cap must remain our advertised local value; the
+        // server's value only bounds frames *we emit*, not frames we accept.
+        assert_eq!(
+            engine.codec.max_frame_size(),
+            16384,
+            "server SETTINGS must not raise our receive frame-size limit"
+        );
     }
 
     #[test]

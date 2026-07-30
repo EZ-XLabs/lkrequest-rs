@@ -75,6 +75,7 @@ impl LktlsQuicClientConfig {
                 ech_config_list: None,
                 custom_ca_anchors: None,
                 keylog_callback: None,
+                client_hello_callback: None,
             },
             port: 443,
         }
@@ -291,6 +292,12 @@ impl Session for LktlsQuicSession {
         self.zero_rtt.as_ref().map(|zero_rtt| zero_rtt.accepted)
     }
 
+    fn early_data_rejected(&self) -> bool {
+        self.zero_rtt
+            .as_ref()
+            .is_some_and(|zero_rtt| zero_rtt.rejected)
+    }
+
     fn is_handshaking(&self) -> bool {
         !self.established
     }
@@ -328,6 +335,9 @@ impl Session for LktlsQuicSession {
         loop {
             match self.driver.progress().map_err(map_tls_error)? {
                 QuicHandshakeOutput::SendData(data) => {
+                    if let Some(ref mut zero_rtt) = self.zero_rtt {
+                        zero_rtt.rejected = true;
+                    }
                     tracing::trace!(bytes = data.len(), "quic.tls_send_data");
                     self.pending_output.push_back(data);
                 }
@@ -790,6 +800,7 @@ struct ZeroRttState {
     keys: LktlsPacketKeys,
     aead_algorithm: AeadAlgorithm,
     accepted: bool,
+    rejected: bool,
 }
 
 #[derive(Debug)]
@@ -850,6 +861,7 @@ fn derive_early_crypto(
         keys,
         aead_algorithm: ticket.aead_algorithm,
         accepted: false,
+        rejected: false,
     })
 }
 
@@ -913,15 +925,55 @@ mod tests {
         lktls::verify::certchain::parse_trust_anchor_from_der(cert.as_ref()).unwrap()
     }
 
+    fn build_hrr(session_id: &[u8], cipher_suite: u16, selected_group: u16) -> Vec<u8> {
+        let extensions = [
+            0x00,
+            0x2b,
+            0x00,
+            0x02,
+            0x03,
+            0x04,
+            0x00,
+            0x33,
+            0x00,
+            0x02,
+            (selected_group >> 8) as u8,
+            selected_group as u8,
+        ];
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&lktls::handshake::server_hello::HRR_RANDOM);
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&cipher_suite.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let body_len = body.len() as u32;
+        let mut message = vec![
+            0x02,
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ];
+        message.extend_from_slice(&body);
+        message
+    }
+
     #[tokio::test]
-    async fn lktls_quic_handshake_with_rustls_server_and_h3_request() {
+    async fn lktls_quic_hrr_with_p384_server_and_h3_request() {
         ensure_rustls_provider();
         let cert = generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let cert_der = CertificateDer::from(cert.cert.der().to_vec());
         let key_der =
             PrivateKeyDer::from(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
-        let mut server_tls = rustls::ServerConfig::builder()
+        let mut provider = rustls::crypto::ring::default_provider();
+        provider.kx_groups = vec![rustls::crypto::ring::kx_group::SECP384R1];
+        let mut server_tls = rustls::ServerConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![cert_der.clone()], key_der)
             .unwrap();
@@ -960,6 +1012,8 @@ mod tests {
         let anchor = trust_anchor_from_der(&cert_der);
         let client_crypto = LktlsQuicClientConfig::new({
             let mut profile = presets::chrome_144();
+            assert!(profile.supported_groups.contains(&0x0018));
+            assert!(!profile.key_share_curves.contains(&0x0018));
             profile.alpn_protocols = vec!["h3".to_string()];
             profile
         })
@@ -1105,5 +1159,64 @@ mod tests {
         assert_eq!(state.keys.iv.len(), 12);
         assert_eq!(state.keys.hp_key.len(), 16);
         assert!(!state.accepted);
+        assert!(!state.rejected);
+    }
+
+    #[test]
+    fn hrr_rejects_zero_rtt_before_handshake_completion() {
+        let store = Arc::new(lktls::session_store::InMemorySessionStore::new());
+        store.store(
+            "example.com:443",
+            SessionTicketData {
+                ticket: vec![1, 2, 3],
+                resumption_psk: vec![0xAA; 32],
+                tls_version: TicketTlsVersion::Tls13,
+                cipher_suite: 0x1301,
+                lifetime_secs: 3600,
+                age_add: 0,
+                received_at: std::time::Instant::now(),
+                alpn: Some("h3".into()),
+                hkdf_algorithm: lktls::crypto::hkdf::HkdfAlgorithm::Sha256,
+                aead_algorithm: AeadAlgorithm::Aes128Gcm,
+                master_secret: Vec::new(),
+                max_early_data_size: 16_384,
+                peer_transport_parameters: Some(vec![0x01, 0x00]),
+            },
+        );
+
+        let mut profile = presets::chrome_144();
+        profile.alpn_protocols = vec!["h3".to_string()];
+        let config = Arc::new(LktlsQuicClientConfig::new(profile).session_store(store));
+        let transport_parameters = TransportParameters::read(Side::Server, &mut &[][..]).unwrap();
+        let mut session =
+            ProtoClientConfig::start_session(config, 1, "example.com", &transport_parameters)
+                .unwrap();
+
+        assert!(session.early_crypto().is_some());
+        assert!(!session.early_data_rejected());
+        let mut ch1 = Vec::new();
+        assert!(session.write_handshake(&mut ch1).is_none());
+        let sid_len = ch1[38] as usize;
+        let session_id = &ch1[39..39 + sid_len];
+        let hrr = build_hrr(session_id, 0x1301, 0x0018);
+
+        assert!(!session.read_handshake(&hrr).unwrap());
+        assert!(session.early_data_rejected());
+        let mut ch2 = Vec::new();
+        assert!(session.write_handshake(&mut ch2).is_none());
+        assert!(!ch2.is_empty());
+    }
+
+    #[test]
+    fn local_tls_alert_maps_to_quic_crypto_error() {
+        let error = TlsError::local_alert(
+            lktls::error::AlertDescription::IllegalParameter,
+            "invalid HRR",
+        );
+        let transport = map_tls_error(error);
+        assert_eq!(
+            transport.code,
+            TransportErrorCode::crypto(lktls::error::AlertDescription::IllegalParameter.as_byte())
+        );
     }
 }

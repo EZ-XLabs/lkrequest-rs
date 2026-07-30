@@ -654,9 +654,9 @@ dependencies = [
 
 [[package]]
 name = "crossbeam-epoch"
-version = "0.9.18"
+version = "0.9.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b82ac4a3c2ca9c3460964f020e1402edd5753411d7737aa39c3714ad1b5420e"
+checksum = "2d6914041f254d6e9176c01941b21115dcfb7089e55135a35411081bd106ef3f"
 dependencies = [
  "crossbeam-utils",
 ]
@@ -1721,7 +1721,7 @@ checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
 
 [[package]]
 name = "lkh2"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1741,7 +1741,7 @@ dependencies = [
 
 [[package]]
 name = "lkh3"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytes",
  "h3",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "lkprofile"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "hex",
  "lktls",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "lkquic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "quinn",
  "quinn-proto",
@@ -1786,7 +1786,7 @@ dependencies = [
 
 [[package]]
 name = "lkrequest"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -1842,7 +1842,7 @@ dependencies = [
 
 [[package]]
 name = "lkrequest-ffi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -1859,7 +1859,7 @@ dependencies = [
 
 [[package]]
 name = "lktls"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -1884,7 +1884,7 @@ dependencies = [
 
 [[package]]
 name = "lktls-quic"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "aws-lc-rs",
@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 dependencies = [
  "bytes",
  "getrandom 0.3.4",

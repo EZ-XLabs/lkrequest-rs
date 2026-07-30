@@ -5,7 +5,7 @@
 //!
 //! ## Two-phase API
 //!
-//! Per draft-ietf-tls-esni-24 Section 5.2, the outer ClientHello AAD must
+//! Per RFC 9849 Section 6.1, the outer ClientHello AAD must
 //! contain the **real** `enc` value (with only the `payload` field zeroed).
 //! This requires a two-phase flow:
 //!
@@ -40,8 +40,8 @@ pub struct EchHpkeSealResult {
 
 /// Opaque HPKE sender context returned by [`ech_hpke_setup`].
 ///
-/// Holds the encryption context created by `setup_sender`.  Call `seal`
-/// once the AAD (with real `enc`) is ready.
+/// Holds the encryption context created by `setup_sender`. The context is
+/// retained across HelloRetryRequest so CH2 can advance the same HPKE sequence.
 #[allow(private_interfaces)]
 pub enum EchHpkeSenderCtx {
     #[doc(hidden)]
@@ -54,8 +54,8 @@ impl EchHpkeSenderCtx {
     /// Seal (encrypt) the plaintext with the given AAD.
     ///
     /// The AAD **must** contain the real `enc` value (with payload zeroed)
-    /// per draft-ietf-tls-esni-24 Section 5.2.
-    pub fn seal(self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    /// per RFC 9849 Section 6.1.
+    pub fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         match self {
             Self::Aes128Gcm(ctx) => ctx.seal(plaintext, aad),
             Self::ChaCha20Poly1305(ctx) => ctx.seal(plaintext, aad),
@@ -104,7 +104,7 @@ pub fn ech_hpke_seal(
     encoded_inner: &[u8],
     aad: &[u8],
 ) -> Result<EchHpkeSealResult> {
-    let setup = ech_hpke_setup(ech_config, cipher_suite)?;
+    let mut setup = ech_hpke_setup(ech_config, cipher_suite)?;
     let ciphertext = setup.sender_ctx.seal(encoded_inner, aad)?;
     Ok(EchHpkeSealResult {
         enc: setup.enc,
@@ -125,8 +125,8 @@ pub fn aead_overhead(aead_id: u16) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Internal trait to allow storing heterogeneous HPKE sender contexts.
-trait SealOnce: Send {
-    fn seal(self: Box<Self>, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
+trait SealOnce: Send + Sync {
+    fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,7 +142,7 @@ struct Aes128GcmSender {
 }
 
 impl SealOnce for Aes128GcmSender {
-    fn seal(mut self: Box<Self>, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         self.ctx
             .seal(plaintext, aad)
             .map_err(|e| TlsError::CryptoError(format!("HPKE seal failed: {e}")))
@@ -190,7 +190,7 @@ struct ChaCha20Poly1305Sender {
 }
 
 impl SealOnce for ChaCha20Poly1305Sender {
-    fn seal(mut self: Box<Self>, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
+    fn seal(&mut self, plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>> {
         self.ctx
             .seal(plaintext, aad)
             .map_err(|e| TlsError::CryptoError(format!("HPKE seal failed: {e}")))
@@ -367,7 +367,7 @@ mod tests {
         let plaintext = b"test plaintext data";
         let aad = b"additional authenticated data";
 
-        let setup = ech_hpke_setup(&config, &cs).unwrap();
+        let mut setup = ech_hpke_setup(&config, &cs).unwrap();
         let ciphertext = setup.sender_ctx.seal(plaintext, aad).unwrap();
         assert_eq!(
             ciphertext.len(),
@@ -381,7 +381,7 @@ mod tests {
         let (_sk, pk) = generate_test_keypair();
         let (config, cs) = make_test_config(pk, 0x0003);
 
-        let setup = ech_hpke_setup(&config, &cs).unwrap();
+        let mut setup = ech_hpke_setup(&config, &cs).unwrap();
         assert_eq!(setup.enc.len(), 32);
         let ct = setup.sender_ctx.seal(b"firefox test", b"aad").unwrap();
         assert_eq!(ct.len(), 12 + AEAD_TAG_LEN);
@@ -501,7 +501,7 @@ mod tests {
         let plaintext = b"two-phase roundtrip test";
 
         // Phase 1: setup → get enc
-        let setup = ech_hpke_setup(&config, &cs).unwrap();
+        let mut setup = ech_hpke_setup(&config, &cs).unwrap();
         let enc = setup.enc.clone();
 
         // Phase 2: build AAD containing real enc, then seal

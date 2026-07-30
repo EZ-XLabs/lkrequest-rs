@@ -723,6 +723,85 @@ pub fn chrome_146_quic() -> QuicProfile {
     }
 }
 
+/// Chrome 150 HTTP/3 fingerprint profile.
+///
+/// Captured from Chrome 150.0.7871.47 on Windows while navigating to Outlook.
+/// The H3 SETTINGS match the Chrome family baseline. The first request stream
+/// receives a navigation PRIORITY_UPDATE of `u=0, i`. This value is
+/// request-context-sensitive and must be recaptured when targeting a different
+/// Chrome milestone or resource type.
+pub fn chrome_150_h3() -> H3Profile {
+    let mut profile = chrome_h3();
+    profile.priority_updates = vec![(0, "u=0, i".into())];
+    profile
+}
+
+/// Chrome 150 QUIC + HTTP/3 fingerprint profile.
+///
+/// Stable fields are taken from the Chrome 150 Outlook captures: 8-byte Initial
+/// DCID, QPACK capacity 65 536, 100 blocked streams, 103 unidirectional streams,
+/// 65 536-byte DATAGRAM support, `version_information`, and
+/// `google_connection_options=ORIG`. The reserved transport parameter is a
+/// one-byte placeholder whose id and value are randomized per connection.
+pub fn chrome_150_quic() -> QuicProfile {
+    QuicProfile {
+        transport_params: QuicTransportParams {
+            max_idle_timeout: 30_000,
+            max_udp_payload_size: Some(1472),
+            initial_max_data: 15_728_640,
+            initial_max_stream_data_bidi_local: 6_291_456,
+            initial_max_stream_data_bidi_remote: 6_291_456,
+            initial_max_stream_data_uni: 6_291_456,
+            initial_max_streams_bidi: 100,
+            initial_max_streams_uni: 103,
+            active_connection_id_limit: 2,
+            max_datagram_frame_size: Some(65_536),
+            send_min_ack_delay: false,
+            send_reserved_transport_parameter: false,
+            extra_transport_parameters: vec![
+                (
+                    0x11,
+                    "000000019a9aca7a00000001".to_string(), // version_information
+                ),
+                (0x17af394a4ef8da0a, "00".to_string()), // one-byte GREASE placeholder
+                (0x3128, "4f524947".to_string()),       // google_connection_options = ORIG
+                (0x3127, "8009df94".to_string()),       // path-sensitive google_initial_rtt
+            ],
+            transport_parameter_order: vec![
+                0x05,
+                0x0f,
+                0x04,
+                0x20,
+                0x06,
+                0x09,
+                0x3128,
+                0x17af394a4ef8da0a,
+                0x3127,
+                0x01,
+                0x03,
+                0x07,
+                0x08,
+                0x11,
+            ],
+            grease_transport_params: false,
+            shuffle_transport_parameters: true,
+        },
+        h3: chrome_150_h3(),
+        connection_id_length: 0,
+        initial_destination_connection_id_length: Some(8),
+        packetization: QuicPacketizationProfile {
+            initial_mtu: Some(1250),
+            initial_datagram_size: Some(1250),
+            disable_mtu_discovery: false,
+            enable_segmentation_offload: false,
+            enable_ecn: false,
+            // The Chrome 150 report did not establish a stable CRYPTO/PADDING
+            // fragmentation layout, so do not reuse Chrome 146's exact layout.
+            initial_frame_layout: None,
+        },
+    }
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![
@@ -864,6 +943,55 @@ mod tests {
         let json = serde_json::to_string(&profile).unwrap();
         let decoded: QuicProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn chrome_150_quic_matches_captured_stable_fields() {
+        let profile = chrome_150_quic();
+        profile.validate().unwrap();
+
+        assert_eq!(profile.transport_params.max_idle_timeout, 30_000);
+        assert_eq!(profile.transport_params.max_udp_payload_size, Some(1472));
+        assert_eq!(profile.transport_params.initial_max_streams_uni, 103);
+        assert_eq!(
+            profile.transport_params.max_datagram_frame_size,
+            Some(65_536)
+        );
+        assert!(!profile.transport_params.send_min_ack_delay);
+        assert_eq!(profile.initial_destination_connection_id_length, Some(8));
+        assert_eq!(profile.packetization.initial_mtu, Some(1250));
+        assert_eq!(profile.packetization.initial_datagram_size, Some(1250));
+        assert!(profile.packetization.initial_frame_layout.is_none());
+        assert_eq!(profile.h3.qpack_max_table_capacity, 65_536);
+        assert_eq!(profile.h3.qpack_blocked_streams, 100);
+        assert_eq!(profile.h3.priority_updates, vec![(0, "u=0, i".into())]);
+        assert_eq!(
+            profile.transport_params.extra_transport_parameters,
+            vec![
+                (0x11, "000000019a9aca7a00000001".to_string()),
+                (0x17af394a4ef8da0a, "00".to_string()),
+                (0x3128, "4f524947".to_string()),
+                (0x3127, "8009df94".to_string()),
+            ]
+        );
+
+        let json = serde_json::to_string(&profile).unwrap();
+        let decoded: QuicProfile = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn chrome_150_is_independent_from_chrome_146() {
+        let v146 = chrome_146_quic();
+        let v150 = chrome_150_quic();
+
+        assert_ne!(v146.h3.priority_updates, v150.h3.priority_updates);
+        assert_ne!(
+            v146.transport_params.extra_transport_parameters,
+            v150.transport_params.extra_transport_parameters
+        );
+        assert!(v146.packetization.initial_frame_layout.is_some());
+        assert!(v150.packetization.initial_frame_layout.is_none());
     }
 
     #[test]

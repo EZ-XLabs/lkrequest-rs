@@ -9,13 +9,14 @@ lkrequest 可以精确模拟真实浏览器的网络指纹——包括 TLS Clien
 - **TLS 指纹控制** — 字节级 ClientHello 生成，精确匹配真实浏览器（Chrome、Firefox、Safari）
 - **HTTP/2 指纹控制** — SETTINGS 帧顺序、伪头顺序、WINDOW_UPDATE、PRIORITY 帧、每请求优先级权重
 - **HTTP/3 + QUIC** — 通过可选的 `quic-h3` feature 启用完整 HTTP/3 协议栈，支持指纹感知的传输参数、Alt-Svc 自动发现、H2→H3 无缝升级
-- **内置浏览器预设** — Chrome 131/144/145/146/147/148/149、Firefox 133/147、Safari 18/26（TLS + H2；启用 `quic-h3` 后再带 QUIC）
+- **内置浏览器预设** — Chrome 131/144/145/146/147/148/149/150、Firefox 133/147、Safari 18/26（TLS + H2；启用 `quic-h3` 后再带 QUIC）
+- **指纹随机化** — 可选的 `synthetic-fp` feature：每会话生成*合成*指纹（扩展顺序抖动、预设重组、语料外扰动），可通过 `Layers` 掩码按层组合，并受可配置的“可协商底线”约束
 - **会话管理** — Cookie 容器、连接池、HTTP/2 多路复用，以及可选的 QUIC 0-RTT 会话恢复
 - **连接预热** — `session.preconnect()` 预建立 DNS + TCP + TLS + H2（启用 `quic-h3` 时也可预热 QUIC + H3）连接
 - **自定义 DNS 解析器** — 可插拔 DNS，支持 DoH，通过 HTTPS/SVCB 记录自动获取 ECH 配置和 H3 提示
 - **Alt-Svc 发现** — 通过 Alt-Svc 头自动从 HTTP/2 升级到 HTTP/3，含 QUIC 故障回退
 - **SessionPool** — 高并发会话池，支持代理轮换（轮询 / 随机）
-- **代理支持** — SOCKS5 和 HTTP CONNECT，支持认证
+- **代理支持** — SOCKS5 和 HTTP CONNECT，支持认证；并支持多跳**代理链**（QUIC/H3 可在全 SOCKS5 链上运行）
 - **WebSocket** — HTTP/1.1 Upgrade (RFC 6455) 和 H2 Extended CONNECT (RFC 8441)
 - **中间件** — 拦截器链，用于请求/响应修改
 - **重试策略** — 指数退避、固定间隔、自定义策略
@@ -298,6 +299,27 @@ let session = client.session()
     .build();
 ```
 
+### 代理链（多跳）
+
+经一串有序代理转发（客户端 → hop1 → hop2 → … → 目标）。
+TCP（HTTP/1.1、HTTP/2）支持 HTTP CONNECT 与 SOCKS5 任意混合的跳。
+**QUIC/HTTP/3** 支持在**全 SOCKS5** 链上运行（嵌套 UDP ASSOCIATE）；
+链中若含 HTTP 跳，QUIC 会报错并回退到 H2。
+
+```rust
+use lkrequest::proxy::ProxyConfig;
+
+// 客户端 → hop1 → hop2 → 目标
+let chain = ProxyConfig::parse_chain([
+    "socks5://user:pass@hop1:1080",
+    "socks5://user:pass@hop2:1080",
+])?;
+
+let session = client.session()
+    .proxy_config(chain)
+    .build();
+```
+
 ### SessionPool 代理轮换
 
 ```rust
@@ -460,10 +482,15 @@ let resp = h3_session.get("https://quic.browserleaks.com/json").send().await?;
 | `chrome_147()` | — | Chrome 147 (Windows) |
 | `chrome_148()` | — | Chrome 148 (Windows) |
 | `chrome_149()` | — | Chrome 149 (Windows) |
+| `chrome_150()` | — | Chrome 150 (Windows) |
 | `firefox_133()` | — | Firefox 133 |
 | `firefox_147()` | — | Firefox 147 |
 | `safari_18()` | — | Safari 18 (macOS) |
 | `safari_26()` | — | Safari 26 (macOS) |
+
+> **Chrome 150** 在线缆层与 Chrome 149 一致，**唯一区别**（从 TLS/H2 (TCP) ClientHello 抓包所得）是在 `signature_algorithms` 最前面加了三个 ML-DSA 后量子签名码点（`0x0904`/`0x0905`/`0x0906` = `mldsa44`/`65`/`87`）。这会改变 **JA4**、但不影响 **JA3**（JA3 不含签名算法）；且无需任何 PQC 加密实现——码点只是广告，真实服务器不会真的协商它。
+>
+> **Chrome 150 的 HTTP/3 未随之更新。** `preset::chrome_150()` 的 QUIC/H3 仍复用共享的 Chrome 146 传输 profile（与 Chrome 144–149 一致），因此其 QUIC ClientHello **暂不带** ML-DSA 签名算法。Chrome 150 的 H3 抓包待补——本地抓取被 Chrome 对 QUIC 的证书强制校验挡住。
 
 ### 客户端预设（TLS + H2 + 可选 QUIC + 请求头/Cookie 顺序）
 

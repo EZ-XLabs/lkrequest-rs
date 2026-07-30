@@ -6,6 +6,7 @@
 
 use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
+use crate::crypto::hkdf::HkdfAlgorithm;
 use crate::crypto::kx::{self, EphemeralKeyPair, KxGroup};
 use crate::error::{Result, TlsError};
 use crate::extensions::alpn::Alpn;
@@ -20,6 +21,7 @@ use crate::extensions::generic::GenericExtension;
 use crate::extensions::grease::{self, GreaseExtension};
 use crate::extensions::key_share::{KeyShare, KeyShareEntry};
 use crate::extensions::padding::Padding;
+use crate::extensions::pre_shared_key::{self, PskIdentity};
 use crate::extensions::psk_key_exchange_modes::{self, PskKeyExchangeModes};
 use crate::extensions::record_size_limit::RecordSizeLimit;
 use crate::extensions::renegotiation_info::RenegotiationInfo;
@@ -77,11 +79,17 @@ pub struct ClientHelloBuilder<'a> {
     pub(crate) quic_transport_parameters: Option<Vec<u8>>,
     /// Whether to advertise TLS 1.3 early_data (0-RTT) in ClientHello.
     pub(crate) early_data: bool,
+    /// Real PSK offer for ClientHelloInner when ECH is active.
+    pub(crate) psk_offer: Option<PskOffer>,
     /// Pre-existing GREASE values to reuse (e.g. from CH1 during HRR).
     /// When set, these values are used instead of generating fresh ones.
     pub(crate) grease_values: Option<grease::GreaseValues>,
-    /// Whether this is a HRR retry (CH2). Affects key_share GREASE behavior.
-    pub(crate) is_retry: bool,
+    /// Precomputed extension order from CH1, reused verbatim for CH2.
+    pub(crate) extension_order: Option<Vec<crate::profile::types::ExtensionSpec>>,
+    /// Complete encoded fake ECH extension from CH1, including its header.
+    pub(crate) ech_grease_extension: Option<Vec<u8>>,
+    /// Whether HRR requested replacement of the key_share extension.
+    omit_grease_key_share: bool,
     /// RNG used for the extension-order shuffle (when
     /// `randomization.shuffle_extensions` is enabled). `None` uses a fresh OS
     /// RNG each build (non-reproducible, the historical behavior); inject a
@@ -90,6 +98,15 @@ pub struct ClientHelloBuilder<'a> {
     /// `RefCell` because the shuffle happens inside `build(&self)`; the builder
     /// is used within a single connection setup, never shared across threads.
     pub(crate) shuffle_rng: std::cell::RefCell<Option<Box<dyn rand_core::RngCore + Send>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct PskOffer {
+    identity: Vec<u8>,
+    obfuscated_ticket_age: u32,
+    resumption_psk: Vec<u8>,
+    hkdf_algorithm: HkdfAlgorithm,
+    transcript_prefix: Vec<u8>,
 }
 
 impl<'a> ClientHelloBuilder<'a> {
@@ -105,8 +122,11 @@ impl<'a> ClientHelloBuilder<'a> {
             ech_config_list: None,
             quic_transport_parameters: None,
             early_data: false,
+            psk_offer: None,
             grease_values: None,
-            is_retry: false,
+            extension_order: None,
+            ech_grease_extension: None,
+            omit_grease_key_share: false,
             shuffle_rng: std::cell::RefCell::new(None),
         }
     }
@@ -185,6 +205,28 @@ impl<'a> ClientHelloBuilder<'a> {
         self
     }
 
+    /// Add a real PSK identity to ClientHelloInner.
+    ///
+    /// `transcript_prefix` is empty for CH1. For CH2 it contains the synthetic
+    /// `message_hash(ClientHelloInner1)` followed by HelloRetryRequest.
+    pub(crate) fn with_psk_offer(
+        mut self,
+        identity: Vec<u8>,
+        obfuscated_ticket_age: u32,
+        resumption_psk: Vec<u8>,
+        hkdf_algorithm: HkdfAlgorithm,
+        transcript_prefix: Vec<u8>,
+    ) -> Self {
+        self.psk_offer = Some(PskOffer {
+            identity,
+            obfuscated_ticket_age,
+            resumption_psk,
+            hkdf_algorithm,
+            transcript_prefix,
+        });
+        self
+    }
+
     /// Reuse GREASE values from a previous ClientHello (for HRR retries).
     ///
     /// RFC 8446 Section 4.1.2 requires that the updated ClientHello after
@@ -195,17 +237,56 @@ impl<'a> ClientHelloBuilder<'a> {
         self
     }
 
+    /// Reuse the exact extension permutation selected for CH1.
+    pub(crate) fn with_extension_order(
+        mut self,
+        order: Vec<crate::profile::types::ExtensionSpec>,
+    ) -> Self {
+        self.extension_order = Some(order);
+        self
+    }
+
+    /// Reuse the complete fake ECH extension emitted in CH1.
+    pub(crate) fn with_ech_grease_extension(mut self, extension: Vec<u8>) -> Self {
+        self.ech_grease_extension = Some(extension);
+        self
+    }
+
     /// Build the ClientHello using pre-existing key pairs (for HRR).
     ///
     /// Instead of generating new key pairs, uses the provided ones.
     /// Marks the build as a retry, which skips GREASE in key_share
     /// (matching BoringSSL/Chrome behavior after HelloRetryRequest).
-    pub fn build_with_key_pairs(
+    pub fn build_with_key_pairs(self, key_pairs: &[EphemeralKeyPair]) -> Result<ClientHelloOutput> {
+        self.build_retry_with_key_pairs(key_pairs, None)
+    }
+
+    /// Build CH2 while continuing an existing real-ECH HPKE context.
+    pub(crate) fn build_retry_with_key_pairs(
         mut self,
         key_pairs: &[EphemeralKeyPair],
+        ech_retry: Option<&mut EchRetryState>,
     ) -> Result<ClientHelloOutput> {
-        self.is_retry = true;
-        self.build_internal(Some(key_pairs), 0)
+        self.omit_grease_key_share = true;
+        if let Some(ech_retry) = ech_retry {
+            self.build_with_real_ech_retry(key_pairs, ech_retry)
+        } else {
+            self.build_internal(Some(key_pairs), 0)
+        }
+    }
+
+    /// Build CH2 for a cookie-only HRR while retaining the original key shares.
+    pub(crate) fn build_cookie_retry_with_key_pairs(
+        mut self,
+        key_pairs: &[EphemeralKeyPair],
+        ech_retry: Option<&mut EchRetryState>,
+    ) -> Result<ClientHelloOutput> {
+        self.omit_grease_key_share = false;
+        if let Some(ech_retry) = ech_retry {
+            self.build_with_real_ech_retry(key_pairs, ech_retry)
+        } else {
+            self.build_internal(Some(key_pairs), 0)
+        }
     }
 
     /// Build the complete ClientHello handshake message bytes.
@@ -276,7 +357,10 @@ impl<'a> ClientHelloBuilder<'a> {
         // --- Step 6: Extensions (first pass, without padding) ---
         // Compute the (possibly shuffled) extension order once.  This order
         // is stored in the output so the ECH inner CH can reuse it.
-        let extension_order = self.compute_extension_order();
+        let extension_order = self
+            .extension_order
+            .clone()
+            .unwrap_or_else(|| self.compute_extension_order());
         let (ext_data_no_padding, padding_insert_pos) = self.encode_extensions_without_padding(
             key_pairs_for_encoding,
             &grease,
@@ -345,11 +429,22 @@ impl<'a> ClientHelloBuilder<'a> {
         msg.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
         msg.extend_from_slice(&ext_data);
 
+        let ech_grease_extension = if matches!(self.profile.ech, Some(EchMode::Grease(_)))
+            && self.ech_config_list.is_none()
+        {
+            extract_ech_extension(&msg).ok()
+        } else {
+            None
+        };
+
         Ok(ClientHelloOutput {
             message: msg,
             key_shares: key_pairs,
             inner_hello: None,
+            encoded_inner_hello: None,
             ech_offered: false,
+            ech_retry_state: None,
+            ech_grease_extension,
             grease_values: grease,
             shuffled_extensions: extension_order,
         })
@@ -515,8 +610,9 @@ impl<'a> ClientHelloBuilder<'a> {
         let mut outer_output = self.build_internal(None, psk_extra_len)?;
 
         // --- Step 3: Build inner CH body (real SNI, inner ECH ext, empty session_id) ---
-        let inner_ch_body =
-            self.build_inner_ch_body(selected_config, &selected_cs, &outer_output)?;
+        let mut inner_ch_body =
+            self.build_inner_ch_body(selected_config, &selected_cs, &outer_output, None)?;
+        self.append_inner_psk_and_fill_binder(&mut inner_ch_body, &outer_output.message)?;
 
         // --- Step 4: Encode as EncodedClientHelloInner with padding ---
         let padding_len = inner::compute_ech_padding(
@@ -529,21 +625,159 @@ impl<'a> ClientHelloBuilder<'a> {
 
         // --- Step 5: Build the outer CH with real ECH extension ---
         // Re-build the outer with public_name as SNI and the real ECH extension.
-        let outer_with_ech = self.rebuild_outer_with_ech(
+        let (outer_with_ech, sender_context) = self.rebuild_outer_with_ech(
             &outer_output.message,
             selected_config,
             &selected_cs,
             &encoded_inner,
         )?;
 
-        // Build the inner CH with handshake header for transcript purposes.
-        let inner_hello = self.build_inner_hello_message(&inner_ch_body, &outer_output.message);
+        // Inner CH for the handshake transcript: the EXPANDED reconstruction
+        // (outer's session_id spliced in, `ech_outer_extensions` expanded) — i.e.
+        // exactly what the server rebuilds and hashes.
+        let inner_hello = self.build_inner_hello_message(&inner_ch_body, &outer_output.message)?;
 
         outer_output.message = outer_with_ech;
         outer_output.inner_hello = Some(inner_hello);
+        // Expose the *actual* sealed plaintext (empty legacy_session_id +
+        // `ech_outer_extensions` compression + ECH padding, no Handshake header)
+        // so diagnostics can diff it byte-for-byte against what HPKE encrypted /
+        // the server decrypts. `encoded_inner` is exactly what was passed to
+        // `seal()` above (its last use, so move it in).
+        outer_output.encoded_inner_hello = Some(encoded_inner);
         outer_output.ech_offered = true;
+        outer_output.ech_retry_state = Some(EchRetryState {
+            config: selected_config.clone(),
+            cipher_suite: selected_cs,
+            sender_context,
+            inner_random: inner_ch_body[2..34]
+                .try_into()
+                .expect("ECH inner ClientHello random has fixed length"),
+        });
 
         Ok(outer_output)
+    }
+
+    fn build_with_real_ech_retry(
+        &self,
+        key_pairs: &[EphemeralKeyPair],
+        ech_retry: &mut EchRetryState,
+    ) -> Result<ClientHelloOutput> {
+        use crate::ech::inner;
+
+        let psk_extra_len = self.psk_offer.as_ref().map_or(0, |offer| {
+            pre_shared_key::psk_extension_length(
+                offer.identity.len(),
+                offer.hkdf_algorithm.hash_len(),
+            )
+        });
+        let mut outer_output = self.build_internal(Some(key_pairs), psk_extra_len)?;
+        let mut inner_ch_body = self.build_inner_ch_body(
+            &ech_retry.config,
+            &ech_retry.cipher_suite,
+            &outer_output,
+            Some(ech_retry.inner_random),
+        )?;
+        self.append_inner_psk_and_fill_binder(&mut inner_ch_body, &outer_output.message)?;
+        let padding_len = inner::compute_ech_padding(
+            inner_ch_body.len(),
+            &self.hostname,
+            ech_retry.config.maximum_name_length,
+            ech_retry.cipher_suite.aead_id,
+        );
+        let encoded_inner = inner::encode_client_hello_inner(&inner_ch_body, padding_len);
+        let outer_with_ech =
+            self.rebuild_outer_with_ech_retry(&outer_output.message, ech_retry, &encoded_inner)?;
+        let inner_hello = self.build_inner_hello_message(&inner_ch_body, &outer_output.message)?;
+
+        outer_output.message = outer_with_ech;
+        outer_output.inner_hello = Some(inner_hello);
+        outer_output.encoded_inner_hello = Some(encoded_inner);
+        outer_output.ech_offered = true;
+        outer_output.ech_grease_extension = None;
+        Ok(outer_output)
+    }
+
+    fn append_inner_psk_and_fill_binder(
+        &self,
+        inner_ch_body: &mut Vec<u8>,
+        outer_message: &[u8],
+    ) -> Result<()> {
+        let Some(offer) = self.psk_offer.as_ref() else {
+            return Ok(());
+        };
+
+        fn malformed() -> TlsError {
+            TlsError::HandshakeFailure("malformed ClientHelloInner while appending PSK".to_string())
+        }
+
+        let sid_len = *inner_ch_body.get(34).ok_or_else(malformed)? as usize;
+        let cipher_len_pos = 35usize.checked_add(sid_len).ok_or_else(malformed)?;
+        let cipher_len_bytes = inner_ch_body
+            .get(cipher_len_pos..cipher_len_pos + 2)
+            .ok_or_else(malformed)?;
+        let cipher_len = u16::from_be_bytes([cipher_len_bytes[0], cipher_len_bytes[1]]) as usize;
+        let compression_len_pos = cipher_len_pos
+            .checked_add(2 + cipher_len)
+            .ok_or_else(malformed)?;
+        let compression_len = *inner_ch_body
+            .get(compression_len_pos)
+            .ok_or_else(malformed)? as usize;
+        let extensions_len_pos = compression_len_pos
+            .checked_add(1 + compression_len)
+            .ok_or_else(malformed)?;
+        let extensions_len_bytes = inner_ch_body
+            .get(extensions_len_pos..extensions_len_pos + 2)
+            .ok_or_else(malformed)?;
+        let old_extensions_len =
+            u16::from_be_bytes([extensions_len_bytes[0], extensions_len_bytes[1]]) as usize;
+        let extensions_end = extensions_len_pos
+            .checked_add(2 + old_extensions_len)
+            .ok_or_else(malformed)?;
+        if extensions_end != inner_ch_body.len() {
+            return Err(malformed());
+        }
+
+        let binder_len = offer.hkdf_algorithm.hash_len();
+        let identity = PskIdentity {
+            identity: offer.identity.clone(),
+            obfuscated_ticket_age: offer.obfuscated_ticket_age,
+        };
+        let (psk_extension, binder_offset_in_extension) =
+            pre_shared_key::encode_psk_extension(&[identity], binder_len);
+        let new_extensions_len = old_extensions_len
+            .checked_add(psk_extension.len())
+            .filter(|len| *len <= u16::MAX as usize)
+            .ok_or_else(malformed)?;
+        inner_ch_body[extensions_len_pos..extensions_len_pos + 2]
+            .copy_from_slice(&(new_extensions_len as u16).to_be_bytes());
+
+        let psk_extension_start = inner_ch_body.len();
+        inner_ch_body.extend_from_slice(&psk_extension);
+        let binder_offset = psk_extension_start + binder_offset_in_extension;
+
+        let reconstructed_inner = self.build_inner_hello_message(inner_ch_body, outer_message)?;
+        let binders_size = pre_shared_key::binders_size(1, binder_len);
+        let truncated_len = reconstructed_inner
+            .len()
+            .checked_sub(binders_size)
+            .ok_or_else(malformed)?;
+        let algorithm = match offer.hkdf_algorithm {
+            HkdfAlgorithm::Sha256 => &aws_lc_rs::digest::SHA256,
+            HkdfAlgorithm::Sha384 => &aws_lc_rs::digest::SHA384,
+        };
+        let mut transcript = aws_lc_rs::digest::Context::new(algorithm);
+        transcript.update(&offer.transcript_prefix);
+        transcript.update(&reconstructed_inner[..truncated_len]);
+        let transcript_hash = transcript.finish();
+        let binder = pre_shared_key::compute_psk_binder(
+            offer.hkdf_algorithm,
+            &offer.resumption_psk,
+            transcript_hash.as_ref(),
+        )?;
+        inner_ch_body[binder_offset..binder_offset + binder_len].copy_from_slice(&binder);
+
+        Ok(())
     }
 
     /// Build the inner ClientHello body (without Handshake header).
@@ -559,13 +793,14 @@ impl<'a> ClientHelloBuilder<'a> {
         _ech_config: &crate::ech::config::EchConfig,
         _cipher_suite: &crate::ech::config::HpkeSymmetricCipherSuite,
         outer_output: &ClientHelloOutput,
+        retry_random: Option<[u8; 32]>,
     ) -> Result<Vec<u8>> {
         // Reuse outer GREASE values (BoringSSL shares a single GREASE seed
         // per connection for both inner and outer ClientHello).
         let grease = outer_output.grease_values.clone();
 
         // Random (32 bytes) — MUST be different from outer (spec Section 6.1)
-        let random = generate_random_bytes();
+        let random = retry_random.unwrap_or_else(generate_random_bytes);
 
         // Session ID — MUST be empty in EncodedClientHelloInner
         let session_id: Vec<u8> = Vec::new();
@@ -633,6 +868,19 @@ impl<'a> ClientHelloBuilder<'a> {
             .as_deref()
             .unwrap_or(&[51]); // default: compress key_share only
 
+        // Per RFC 9849 §5.1, every extension referenced by
+        // `ech_outer_extensions` MUST be present in ClientHelloOuter (else the
+        // server aborts with `illegal_parameter`). Profile-planned extensions can
+        // be stripped from the actual outer at emit time (e.g. ALPS when there is
+        // no `alps_payload`), so we compress ONLY extensions that really made it
+        // into the outer message.
+        // Parse the outer ClientHello's extension types ONCE; both the membership
+        // set (compression gating) and the GREASE-only reference list below are
+        // derived from it, so the two views can never disagree.
+        let outer_ext_type_list = Self::extract_outer_extension_types(&outer_output.message);
+        let outer_ext_types: std::collections::HashSet<u16> =
+            outer_ext_type_list.iter().copied().collect();
+
         // TLS 1.2-only extensions that BoringSSL skips when
         // `type == ssl_client_hello_inner` (unnecessary in TLS 1.3).
         const INNER_SKIP_EXTENSIONS: &[u16] = &[
@@ -641,7 +889,12 @@ impl<'a> ClientHelloBuilder<'a> {
             ext_type::EC_POINT_FORMATS,       // 11
         ];
 
-        let outer_grease_types = Self::extract_grease_extension_types(&outer_output.message);
+        // GREASE-only view, derived from the same parse as `outer_ext_types`.
+        let outer_grease_types: Vec<u16> = outer_ext_type_list
+            .iter()
+            .copied()
+            .filter(|t| is_grease_value(*t))
+            .collect();
         let mut outer_grease_idx = 0usize;
 
         let key_pairs_for_encoding: Vec<EphemeralKeyPair> = Vec::new();
@@ -676,9 +929,12 @@ impl<'a> ClientHelloBuilder<'a> {
                 continue;
             }
 
-            // Check if this extension should be compressed via ech_outer_extensions
+            // Check if this extension should be compressed via ech_outer_extensions.
+            // §5.1: never reference `encrypted_client_hello`, and never reference an
+            // extension that is not actually present in ClientHelloOuter.
             if compress_ext_types.contains(&ext_type_code)
                 && ext_type_code != ext_type::ENCRYPTED_CLIENT_HELLO
+                && outer_ext_types.contains(&ext_type_code)
             {
                 compressed_types.push(ext_type_code);
                 if first_compressed_pos.is_none() {
@@ -701,6 +957,16 @@ impl<'a> ClientHelloBuilder<'a> {
                             }
                             .encode(&mut buf);
                         }
+                    } else if ext_type_code == ext_type::SUPPORTED_VERSIONS {
+                        // ECH §6.1: ClientHelloInner MUST NOT offer TLS 1.2 or
+                        // below. Emit a TLS-1.3-only supported_versions (keeping
+                        // the GREASE prefix), regardless of the profile min.
+                        let mut versions = Vec::with_capacity(2);
+                        if self.profile.grease.supported_versions {
+                            versions.push(grease.get(grease::GreaseIndex::Version));
+                        }
+                        versions.push(0x0304); // TLS 1.3 only
+                        SupportedVersions { versions }.encode(&mut buf);
                     } else {
                         // All other auto extensions: encode normally
                         self.encode_auto_extension(
@@ -750,7 +1016,7 @@ impl<'a> ClientHelloBuilder<'a> {
         }
 
         // Insert ech_outer_extensions (0xFD00) at the position of the first
-        // compressed extension.  Per draft-ietf-tls-esni-24 Section 5.1, the
+        // compressed extension. Per RFC 9849 Section 5.1, the
         // server replaces 0xFD00 in-place with the referenced extensions, so
         // the position must match the original profile order.
         if !compressed_types.is_empty() {
@@ -769,60 +1035,71 @@ impl<'a> ClientHelloBuilder<'a> {
         Ok(buf)
     }
 
-    /// Extract GREASE extension type codes from an outer ClientHello message.
+    /// Extract every extension's type code from an outer ClientHello *handshake
+    /// message* (with the 4-byte handshake header), in wire order.
     ///
-    /// Parses the handshake message bytes to find extensions whose type matches
-    /// the GREASE pattern (`0x?A?A`).  Returns them in wire order.
-    fn extract_grease_extension_types(outer_message: &[u8]) -> Vec<u16> {
-        let mut result = Vec::new();
-        // Skip Handshake header (4 bytes) to get the ClientHello body.
+    /// This is the single source of truth for "which extensions are in
+    /// ClientHelloOuter": the §5.1 compression-membership set and the GREASE-only
+    /// reference list are both derived from it, so they can never disagree. The
+    /// walk is fully bounds-checked and bounded by the declared extensions length,
+    /// matching [`Self::parse_outer_extensions`] (which returns the same set with
+    /// bytes), so a malformed/truncated message degrades gracefully rather than
+    /// panicking.
+    fn extract_outer_extension_types(outer_message: &[u8]) -> Vec<u16> {
         if outer_message.len() < 4 {
-            return result;
+            return Vec::new();
         }
-        let body = &outer_message[4..];
+        Self::parse_outer_extensions(&outer_message[4..])
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect()
+    }
 
-        // version(2) + random(32) = 34 bytes
+    /// Parse an outer ClientHello *body* (i.e. the handshake message with its
+    /// 4-byte header already stripped) into `(extension_type, full_extension_bytes)`
+    /// pairs, in wire order. `full_extension_bytes` includes the 2-byte type and
+    /// 2-byte length header, so it can be spliced verbatim into a reconstructed CH.
+    ///
+    /// Fully bounds-checked and bounded by the declared extensions-length field;
+    /// returns whatever parsed cleanly (empty on a truncated/malformed prefix)
+    /// instead of panicking.
+    fn parse_outer_extensions(body: &[u8]) -> Vec<(u16, &[u8])> {
+        let mut result = Vec::new();
+        // version(2) + random(32) + session_id_len(1) = 35 bytes minimum
         if body.len() < 35 {
             return result;
         }
         let mut pos = 34;
-
-        // session_id
         let sid_len = body[pos] as usize;
         pos += 1 + sid_len;
         if pos + 2 > body.len() {
             return result;
         }
-
-        // cipher_suites
         let cs_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
         pos += 2 + cs_len;
         if pos + 1 > body.len() {
             return result;
         }
-
-        // compression_methods
         let comp_len = body[pos] as usize;
         pos += 1 + comp_len;
         if pos + 2 > body.len() {
             return result;
         }
-
-        // extensions
         let ext_total_len = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
         pos += 2;
-        let ext_end = pos + ext_total_len;
-
-        while pos + 4 <= ext_end && pos + 4 <= body.len() {
+        // Bound the loop by the DECLARED extensions length (clamped to the buffer),
+        // so this parse matches a server's reconstruction and never reads trailing
+        // bytes that aren't part of the extensions block.
+        let ext_end = (pos + ext_total_len).min(body.len());
+        while pos + 4 <= ext_end {
             let ext_type = u16::from_be_bytes([body[pos], body[pos + 1]]);
             let ext_len = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
-            pos += 4 + ext_len;
-
-            if is_grease_value(ext_type) {
-                result.push(ext_type);
+            if pos + 4 + ext_len > ext_end {
+                break;
             }
+            result.push((ext_type, &body[pos..pos + 4 + ext_len]));
+            pos += 4 + ext_len;
         }
-
         result
     }
 
@@ -836,10 +1113,10 @@ impl<'a> ClientHelloBuilder<'a> {
         ech_config: &crate::ech::config::EchConfig,
         cipher_suite: &crate::ech::config::HpkeSymmetricCipherSuite,
         encoded_inner: &[u8],
-    ) -> Result<Vec<u8>> {
+    ) -> Result<(Vec<u8>, crate::ech::hpke::EchHpkeSenderCtx)> {
         use crate::ech::hpke as ech_hpke;
 
-        // Per draft-ietf-tls-esni-24 Section 5.2, the correct flow is:
+        // Per RFC 9849 Section 6.1, the correct flow is:
         //
         // 1. HPKE SetupBaseS → obtain `enc` + sender context
         // 2. Build the outer CH with real `enc` + zeroed `payload`
@@ -850,7 +1127,7 @@ impl<'a> ClientHelloBuilder<'a> {
         let ciphertext_len = encoded_inner.len() + ech_hpke::AEAD_TAG_LEN;
 
         // --- Phase 1: HPKE SetupBaseS to get enc ---
-        let setup = ech_hpke::ech_hpke_setup(ech_config, cipher_suite)?;
+        let mut setup = ech_hpke::ech_hpke_setup(ech_config, cipher_suite)?;
         let enc = &setup.enc;
 
         // Build real ECH extension bytes with real enc + zeroed payload.
@@ -886,6 +1163,38 @@ impl<'a> ClientHelloBuilder<'a> {
         new_outer[payload_abs_offset..payload_abs_offset + ciphertext_len]
             .copy_from_slice(&ciphertext);
 
+        Ok((new_outer, setup.sender_ctx))
+    }
+
+    fn rebuild_outer_with_ech_retry(
+        &self,
+        original_outer: &[u8],
+        ech_retry: &mut EchRetryState,
+        encoded_inner: &[u8],
+    ) -> Result<Vec<u8>> {
+        use crate::ech::hpke as ech_hpke;
+
+        let ciphertext_len = encoded_inner.len() + ech_hpke::AEAD_TAG_LEN;
+        let mut ech_ext_payload = Vec::new();
+        ech_ext_payload.push(0x00);
+        ech_ext_payload.extend_from_slice(&ech_retry.cipher_suite.kdf_id.to_be_bytes());
+        ech_ext_payload.extend_from_slice(&ech_retry.cipher_suite.aead_id.to_be_bytes());
+        ech_ext_payload.push(ech_retry.config.config_id);
+        ech_ext_payload.extend_from_slice(&0u16.to_be_bytes());
+        ech_ext_payload.extend_from_slice(&(ciphertext_len as u16).to_be_bytes());
+        ech_ext_payload.resize(ech_ext_payload.len() + ciphertext_len, 0);
+
+        let mut new_outer = self.rebuild_outer_message(
+            original_outer,
+            &ech_retry.config.public_name,
+            &ech_ext_payload,
+        )?;
+        let ech_search = find_ech_extension_in_message(&new_outer)?;
+        let ciphertext = ech_retry
+            .sender_context
+            .seal(encoded_inner, &new_outer[4..])?;
+        new_outer[ech_search.payload_offset..ech_search.payload_offset + ciphertext_len]
+            .copy_from_slice(&ciphertext);
         Ok(new_outer)
     }
 
@@ -906,20 +1215,25 @@ impl<'a> ClientHelloBuilder<'a> {
         }
 
         let body = &original[4..];
+        fn malformed() -> TlsError {
+            TlsError::HandshakeFailure("malformed outer CH".to_string())
+        }
         // body: version(2) + random(32) + session_id_len(1) + session_id(N) + ...
-        let sid_len = body[34] as usize;
+        let sid_len = *body.get(34).ok_or_else(malformed)? as usize;
         let after_sid = 35 + sid_len;
 
         // cipher_suites_len(2) + cipher_suites
-        let cs_len = u16::from_be_bytes([body[after_sid], body[after_sid + 1]]) as usize;
+        let cs_hdr = body.get(after_sid..after_sid + 2).ok_or_else(malformed)?;
+        let cs_len = u16::from_be_bytes([cs_hdr[0], cs_hdr[1]]) as usize;
         let after_cs = after_sid + 2 + cs_len;
 
         // compression_methods_len(1) + compression_methods
-        let cm_len = body[after_cs] as usize;
+        let cm_len = *body.get(after_cs).ok_or_else(malformed)? as usize;
         let after_cm = after_cs + 1 + cm_len;
 
         // extensions_len(2) + extensions
-        let _ext_len = u16::from_be_bytes([body[after_cm], body[after_cm + 1]]) as usize;
+        let ext_hdr = body.get(after_cm..after_cm + 2).ok_or_else(malformed)?;
+        let _ext_len = u16::from_be_bytes([ext_hdr[0], ext_hdr[1]]) as usize;
         let ext_start = after_cm + 2;
 
         // Rebuild extensions
@@ -975,38 +1289,117 @@ impl<'a> ClientHelloBuilder<'a> {
         Ok(msg)
     }
 
-    /// Build the inner CH as a complete handshake message (with header) for transcript.
-    fn build_inner_hello_message(&self, inner_ch_body: &[u8], outer_message: &[u8]) -> Vec<u8> {
-        // The inner hello for transcript purposes needs the session_id from the outer CH
-        // (per spec, EncodedClientHelloInner has empty session_id, but when decoded
-        // the server copies it from outer).
+    fn build_inner_hello_message(
+        &self,
+        inner_ch_body: &[u8],
+        outer_message: &[u8],
+    ) -> Result<Vec<u8>> {
+        // The transcript (and ECH accept_confirmation) is computed over the FULL
+        // reconstructed ClientHelloInner — i.e. the EncodedClientHelloInner with:
+        //   - `ech_outer_extensions` (0xFD00) EXPANDED back into the referenced
+        //     extensions copied from ClientHelloOuter (draft-esni §5.1), and
+        //   - legacy_session_id set to the OUTER's session_id (the server copies
+        //     it during decoding).
+        // The encoded (compressed) form is only what gets sealed; using it for the
+        // transcript makes the client's hash diverge from the server's and breaks
+        // both the accept_confirmation and the handshake keys.
         //
-        // For the client's transcript, we use the inner CH body AS-IS but wrapped
-        // in a handshake header, with the outer's session_id spliced in.
+        // Both inputs are produced internally (a well-formed outer CH and the
+        // encoded inner body), so the checked slicing below should never fail; it
+        // returns an error instead of panicking if an upstream bug ever yields a
+        // truncated message.
+        fn malformed() -> TlsError {
+            TlsError::HandshakeFailure(
+                "malformed ClientHello while building ECH inner transcript".to_string(),
+            )
+        }
 
-        // Extract session_id from outer message
-        let outer_body = &outer_message[4..];
-        let sid_len = outer_body[34] as usize;
-        let session_id = &outer_body[35..35 + sid_len];
+        let outer_body = outer_message.get(4..).ok_or_else(malformed)?;
+        // version(2) + random(32) + session_id_len(1) = 35 bytes minimum.
+        let sid_len = *outer_body.get(34).ok_or_else(malformed)? as usize;
+        let session_id = outer_body.get(35..35 + sid_len).ok_or_else(malformed)?;
 
-        // Build inner CH with session_id from outer
-        let mut inner_with_sid = Vec::with_capacity(inner_ch_body.len() + sid_len);
-        // version(2) + random(32) = first 34 bytes
-        inner_with_sid.extend_from_slice(&inner_ch_body[..34]);
-        // Replace empty session_id with outer's
-        inner_with_sid.push(sid_len as u8);
-        inner_with_sid.extend_from_slice(session_id);
-        // Rest of the body (skip the original empty session_id: 1 byte of length 0)
-        inner_with_sid.extend_from_slice(&inner_ch_body[35..]);
+        // Parse the encoded inner body (empty session_id, no padding here).
+        let version_random = inner_ch_body.get(..34).ok_or_else(malformed)?;
+        let mut p = 35; // skip version(2)+random(32)+sid_len(1=0)
+        let cs_bytes = inner_ch_body.get(p..p + 2).ok_or_else(malformed)?;
+        let cs_len = u16::from_be_bytes([cs_bytes[0], cs_bytes[1]]) as usize;
+        let cipher_suites = inner_ch_body
+            .get(p + 2..p + 2 + cs_len)
+            .ok_or_else(malformed)?;
+        p += 2 + cs_len;
+        let cm_len = *inner_ch_body.get(p).ok_or_else(malformed)? as usize;
+        let compression = inner_ch_body
+            .get(p + 1..p + 1 + cm_len)
+            .ok_or_else(malformed)?;
+        p += 1 + cm_len;
+        let ext_bytes = inner_ch_body.get(p..p + 2).ok_or_else(malformed)?;
+        let ext_len = u16::from_be_bytes([ext_bytes[0], ext_bytes[1]]) as usize;
+        let inner_exts = inner_ch_body
+            .get(p + 2..p + 2 + ext_len)
+            .ok_or_else(malformed)?;
 
-        // Add handshake header
-        let body_len = inner_with_sid.len() as u32;
-        let mut msg = Vec::with_capacity(4 + inner_with_sid.len());
+        let expanded_exts = Self::expand_ech_outer_extensions(inner_exts, outer_body);
+
+        // Reassemble the full ClientHelloInner body with the outer's session_id.
+        let mut body = Vec::with_capacity(
+            34 + 1 + sid_len + 2 + cs_len + 1 + cm_len + 2 + expanded_exts.len(),
+        );
+        body.extend_from_slice(version_random);
+        body.push(sid_len as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&(cs_len as u16).to_be_bytes());
+        body.extend_from_slice(cipher_suites);
+        body.push(cm_len as u8);
+        body.extend_from_slice(compression);
+        body.extend_from_slice(&(expanded_exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&expanded_exts);
+
+        let mut msg = Vec::with_capacity(4 + body.len());
         msg.push(handshake_type::CLIENT_HELLO);
-        msg.extend_from_slice(&body_len.to_be_bytes()[1..4]);
-        msg.extend_from_slice(&inner_with_sid);
+        msg.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+        msg.extend_from_slice(&body);
+        Ok(msg)
+    }
 
-        msg
+    /// Expand the `ech_outer_extensions` (0xFD00) marker in the inner CH's
+    /// extension block by replacing it, in place, with the referenced extensions
+    /// copied verbatim from ClientHelloOuter (in the referenced order), exactly as
+    /// the server reconstructs the ClientHelloInner (RFC 9849 §5.1).
+    fn expand_ech_outer_extensions(inner_exts: &[u8], outer_body: &[u8]) -> Vec<u8> {
+        // (type -> full extension bytes) from ClientHelloOuter, parsed with the
+        // same bounds-checked walk as `extract_outer_extension_types` so the
+        // reconstruction here matches the §5.1 reference set exactly.
+        let outer_exts = Self::parse_outer_extensions(outer_body);
+
+        let mut out = Vec::with_capacity(inner_exts.len() + 512);
+        let mut pos = 0usize;
+        while pos + 4 <= inner_exts.len() {
+            let etype = u16::from_be_bytes([inner_exts[pos], inner_exts[pos + 1]]);
+            let elen = u16::from_be_bytes([inner_exts[pos + 2], inner_exts[pos + 3]]) as usize;
+            if pos + 4 + elen > inner_exts.len() {
+                break;
+            }
+            if etype == 0xFD00 {
+                // Payload: 1-byte list length (in BYTES), then u16 referenced types.
+                let data = &inner_exts[pos + 4..pos + 4 + elen];
+                if !data.is_empty() {
+                    let list_len = data[0] as usize;
+                    let mut i = 1;
+                    while i + 1 < 1 + list_len && i + 1 < data.len() {
+                        let t = u16::from_be_bytes([data[i], data[i + 1]]);
+                        if let Some((_, bytes)) = outer_exts.iter().find(|(ot, _)| *ot == t) {
+                            out.extend_from_slice(bytes);
+                        }
+                        i += 2;
+                    }
+                }
+            } else {
+                out.extend_from_slice(&inner_exts[pos..pos + 4 + elen]);
+            }
+            pos += 4 + elen;
+        }
+        out
     }
 
     // -----------------------------------------------------------------------
@@ -1308,9 +1701,9 @@ impl<'a> ClientHelloBuilder<'a> {
                 let mut entries: Vec<KeyShareEntry> = Vec::new();
 
                 // Optionally prepend a GREASE key_share entry.
-                // After HRR (is_retry), Chrome/BoringSSL omits the GREASE
-                // key_share entry and only sends the server-requested group.
-                if self.profile.grease.key_share && !self.is_retry {
+                // When HRR replaces key_share, Chrome/BoringSSL omits the GREASE
+                // entry and only sends the server-requested group.
+                if self.profile.grease.key_share && !self.omit_grease_key_share {
                     entries.push(KeyShareEntry {
                         group: grease.get(grease::GreaseIndex::Group),
                         key_data: vec![0x00], // 1-byte dummy
@@ -1391,6 +1784,10 @@ impl<'a> ClientHelloBuilder<'a> {
 
             // --- Encrypted Client Hello (ECH) ---
             ext_type::ENCRYPTED_CLIENT_HELLO => {
+                if let Some(ref extension) = self.ech_grease_extension {
+                    buf.extend_from_slice(extension);
+                    return Ok(());
+                }
                 if let Some(ref ech_mode) = self.profile.ech {
                     match ech_mode {
                         EchMode::Grease(config) => {
@@ -1504,6 +1901,9 @@ impl<'a> ClientHelloBuilder<'a> {
 /// Output of the ClientHello builder.
 /// Location of the ECH extension fields within a ClientHello message.
 struct EchExtensionOffsets {
+    /// Absolute offset and length of the complete extension, including header.
+    extension_offset: usize,
+    extension_len: usize,
     /// Absolute offset of the `enc` field data within the message.
     #[allow(dead_code)]
     enc_offset: usize,
@@ -1514,17 +1914,21 @@ struct EchExtensionOffsets {
 /// Find the ECH extension (0xFE0D) in a ClientHello message and return
 /// the byte offsets of the `enc` and `payload` data fields.
 fn find_ech_extension_in_message(msg: &[u8]) -> Result<EchExtensionOffsets> {
+    fn malformed() -> TlsError {
+        TlsError::HandshakeFailure("malformed outer CH while locating ECH extension".to_string())
+    }
     // Skip handshake header (4 bytes)
-    let body = &msg[4..];
+    let body = msg.get(4..).ok_or_else(malformed)?;
 
     // Skip: version(2) + random(32) + session_id_len(1) + session_id(N)
-    let sid_len = body[34] as usize;
+    let sid_len = *body.get(34).ok_or_else(malformed)? as usize;
     let after_sid = 35 + sid_len;
 
     // Skip: cipher_suites_len(2) + cipher_suites + comp_methods_len(1) + comp_methods
-    let cs_len = u16::from_be_bytes([body[after_sid], body[after_sid + 1]]) as usize;
+    let cs_hdr = body.get(after_sid..after_sid + 2).ok_or_else(malformed)?;
+    let cs_len = u16::from_be_bytes([cs_hdr[0], cs_hdr[1]]) as usize;
     let after_cs = after_sid + 2 + cs_len;
-    let cm_len = body[after_cs] as usize;
+    let cm_len = *body.get(after_cs).ok_or_else(malformed)? as usize;
     let after_cm = after_cs + 1 + cm_len;
 
     // Extensions start
@@ -1539,7 +1943,9 @@ fn find_ech_extension_in_message(msg: &[u8]) -> Result<EchExtensionOffsets> {
         if etype == ext_type::ENCRYPTED_CLIENT_HELLO {
             // ECH outer payload structure:
             // type(1) + kdf_id(2) + aead_id(2) + config_id(1) + enc_len(2) + enc(N) + payload_len(2) + payload(M)
-            let inner = &body[data_start..data_start + elen];
+            let inner = body
+                .get(data_start..data_start + elen)
+                .ok_or_else(malformed)?;
             if inner.len() < 10 {
                 return Err(TlsError::HandshakeFailure(
                     "ECH extension too short".to_string(),
@@ -1551,6 +1957,8 @@ fn find_ech_extension_in_message(msg: &[u8]) -> Result<EchExtensionOffsets> {
             let payload_data_offset = 4 + data_start + payload_len_offset + 2;
 
             return Ok(EchExtensionOffsets {
+                extension_offset: 4 + pos,
+                extension_len: 4 + elen,
                 enc_offset: enc_data_offset,
                 payload_offset: payload_data_offset,
             });
@@ -1562,6 +1970,25 @@ fn find_ech_extension_in_message(msg: &[u8]) -> Result<EchExtensionOffsets> {
     Err(TlsError::HandshakeFailure(
         "ECH extension not found in outer ClientHello".to_string(),
     ))
+}
+
+fn extract_ech_extension(msg: &[u8]) -> Result<Vec<u8>> {
+    let offsets = find_ech_extension_in_message(msg)?;
+    msg.get(offsets.extension_offset..offsets.extension_offset + offsets.extension_len)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            TlsError::HandshakeFailure(
+                "malformed outer CH while extracting ECH extension".to_string(),
+            )
+        })
+}
+
+/// Per-handshake state required to continue real ECH after HRR.
+pub(crate) struct EchRetryState {
+    pub(crate) config: crate::ech::config::EchConfig,
+    pub(crate) cipher_suite: crate::ech::config::HpkeSymmetricCipherSuite,
+    pub(crate) sender_context: crate::ech::hpke::EchHpkeSenderCtx,
+    pub(crate) inner_random: [u8; 32],
 }
 
 /// Output of the ClientHello builder.
@@ -1577,14 +2004,30 @@ pub struct ClientHelloOutput {
     /// These must be kept for use in the TLS key exchange after ServerHello.
     pub key_shares: Vec<EphemeralKeyPair>,
 
-    /// The raw inner ClientHello bytes (with Handshake header), if real ECH
-    /// was used.  Needed for transcript switching when the server accepts ECH.
-    ///
-    /// `None` when ECH is not active or only GREASE is used.
+    /// The FULL reconstructed inner ClientHello (with Handshake header), if real
+    /// ECH was used: `ech_outer_extensions` EXPANDED back into the referenced
+    /// outer extensions and the outer's session_id spliced in. This is the form
+    /// used for the handshake transcript and the ECH accept_confirmation (it
+    /// matches what the server reconstructs). `None` unless real ECH is used.
     pub inner_hello: Option<Vec<u8>>,
+
+    /// The exact `EncodedClientHelloInner` plaintext fed to HPKE `seal()`: an
+    /// **empty** `legacy_session_id`, `ech_outer_extensions` compression (the
+    /// `0xFD00` marker is present, NOT expanded), and the ECH zero padding — and
+    /// **no** Handshake header (it is the ClientHello body, not a framed message).
+    /// Callers can reproduce the seal input or diff it byte-for-byte against the
+    /// server-decrypted ECH payload. `None` unless real ECH. (The full
+    /// reconstructed transcript form is [`Self::inner_hello`].)
+    pub encoded_inner_hello: Option<Vec<u8>>,
 
     /// Whether real ECH encryption was performed for this ClientHello.
     pub ech_offered: bool,
+
+    /// HPKE state retained for a possible second ClientHello.
+    pub(crate) ech_retry_state: Option<EchRetryState>,
+
+    /// Complete fake ECH extension bytes emitted by this ClientHello.
+    pub(crate) ech_grease_extension: Option<Vec<u8>>,
 
     /// GREASE values used in this ClientHello, preserved for HRR retries.
     pub grease_values: grease::GreaseValues,
@@ -2147,8 +2590,8 @@ mod tests {
 
     /// Helper: build a test ECHConfigList with a real X25519 key pair.
     fn build_test_ech_config_list_with_keypair(aead_id: u16) -> Vec<u8> {
-        use ::hpke::kem::X25519HkdfSha256;
-        use ::hpke::{Kem, Serializable};
+        use hpke::kem::X25519HkdfSha256;
+        use hpke::{Kem, Serializable};
         use rand_core::TryRngCore;
 
         let (_sk, pk) = X25519HkdfSha256::gen_keypair(&mut rand_core::OsRng.unwrap_err());
@@ -2179,6 +2622,137 @@ mod tests {
         list.extend_from_slice(&config);
 
         list
+    }
+
+    /// Like [`build_test_ech_config_list_with_keypair`] but also returns the
+    /// recipient private key bytes, so a test can play the server and HPKE-open
+    /// the sealed inner.
+    fn build_test_ech_config_list_and_sk(aead_id: u16) -> (Vec<u8>, Vec<u8>) {
+        use hpke::kem::X25519HkdfSha256;
+        use hpke::{Kem, Serializable};
+        use rand_core::TryRngCore;
+
+        let (sk, pk) = X25519HkdfSha256::gen_keypair(&mut rand_core::OsRng.unwrap_err());
+        let pk_bytes = pk.to_bytes();
+        let sk_bytes = sk.to_bytes().to_vec();
+
+        let mut contents = Vec::new();
+        contents.push(42); // config_id
+        contents.extend_from_slice(&0x0020u16.to_be_bytes()); // kem_id = X25519
+        contents.extend_from_slice(&(pk_bytes.len() as u16).to_be_bytes());
+        contents.extend_from_slice(&pk_bytes);
+        contents.extend_from_slice(&4u16.to_be_bytes()); // cipher_suites length
+        contents.extend_from_slice(&0x0001u16.to_be_bytes()); // HKDF-SHA256
+        contents.extend_from_slice(&aead_id.to_be_bytes());
+        contents.push(32); // maximum_name_length
+        let pn = b"public.example.com";
+        contents.push(pn.len() as u8);
+        contents.extend_from_slice(pn);
+        contents.extend_from_slice(&0u16.to_be_bytes()); // no extensions
+
+        let mut config = Vec::new();
+        config.extend_from_slice(&0xFE0Du16.to_be_bytes());
+        config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+        config.extend_from_slice(&contents);
+
+        let mut list = Vec::new();
+        list.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        list.extend_from_slice(&config);
+
+        (list, sk_bytes)
+    }
+
+    /// Decisive ECH crypto check WITHOUT a network: lktls seals the inner; we
+    /// play the server and HPKE-open it with the recipient private key. If this
+    /// fails, the ClientHelloOuterAAD / HPKE info / enc / seal is wrong — exactly
+    /// what makes a real server reject ECH (decrypt failure → retry_configs).
+    #[test]
+    fn test_real_ech_payload_opens_with_recipient_key() {
+        use hpke::aead::AesGcm128;
+        use hpke::kdf::HkdfSha256;
+        use hpke::kem::X25519HkdfSha256;
+        use hpke::{Deserializable, Kem, OpModeR};
+
+        let (config_list, sk_bytes) = build_test_ech_config_list_and_sk(0x0001);
+        let profile = presets::chrome_144();
+        let output = ClientHelloBuilder::new(&profile, "secret.example.com")
+            .with_ech_config(config_list.clone())
+            .build()
+            .expect("ECH build should succeed");
+        let outer = output.message.clone();
+
+        // Locate the ECH extension (0xfe0d) in the outer body and parse it.
+        let body = &outer[4..];
+        let mut pos = 34usize;
+        let sid = body[pos] as usize;
+        pos += 1 + sid;
+        let cs = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2 + cs;
+        let cm = body[pos] as usize;
+        pos += 1 + cm;
+        pos += 2; // extensions length
+        let mut enc = Vec::new();
+        let mut ciphertext = Vec::new();
+        let mut payload_abs = 0usize;
+        let mut payload_len = 0usize;
+        while pos + 4 <= body.len() {
+            let etype = u16::from_be_bytes([body[pos], body[pos + 1]]);
+            let elen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+            let edata = pos + 4;
+            if etype == 0xFE0D {
+                let d = &body[edata..edata + elen];
+                // type(1) kdf(2) aead(2) config_id(1) enc_len(2) enc payload_len(2) payload
+                let enc_len = u16::from_be_bytes([d[6], d[7]]) as usize;
+                enc = d[8..8 + enc_len].to_vec();
+                payload_len = u16::from_be_bytes([d[8 + enc_len], d[9 + enc_len]]) as usize;
+                let pl_off = 10 + enc_len;
+                ciphertext = d[pl_off..pl_off + payload_len].to_vec();
+                payload_abs = 4 + edata + pl_off; // absolute offset in `outer`
+            }
+            pos = edata + elen;
+        }
+        assert!(!ciphertext.is_empty(), "ECH extension with payload present");
+
+        // ClientHelloOuterAAD = outer body (no 4-byte header) with payload zeroed.
+        let mut aad_full = outer.clone();
+        aad_full[payload_abs..payload_abs + payload_len].fill(0);
+        let aad = &aad_full[4..];
+
+        // info = "tls ech" || 0x00 || ECHConfig (the single config incl. version+length)
+        let mut info = Vec::new();
+        info.extend_from_slice(b"tls ech\x00");
+        info.extend_from_slice(&config_list[2..]);
+
+        // Play the server: HPKE setup_receiver + open.
+        let sk = <X25519HkdfSha256 as Kem>::PrivateKey::from_bytes(&sk_bytes).unwrap();
+        let enc_key = <X25519HkdfSha256 as Kem>::EncappedKey::from_bytes(&enc).unwrap();
+        let mut ctx = ::hpke::setup_receiver::<AesGcm128, HkdfSha256, X25519HkdfSha256>(
+            &OpModeR::Base,
+            &sk,
+            &enc_key,
+            &info,
+        )
+        .expect("setup_receiver");
+        let opened = ctx.open(&ciphertext, aad);
+        assert!(
+            opened.is_ok(),
+            "server failed to HPKE-open lktls's ECH payload — AAD/info/enc/seal bug: {:?}",
+            opened.err()
+        );
+        // The decrypted EncodedClientHelloInner is a ClientHello body → starts 0x0303.
+        let inner = opened.unwrap();
+        assert_eq!(&inner[0..2], &[0x03, 0x03]);
+
+        // The server-decrypted plaintext MUST equal `encoded_inner_hello` exactly:
+        // the field is documented as the bytes fed to `seal()`, so a diagnostic
+        // caller can diff the two. (Regression guard — the field previously carried
+        // the outer's session_id + a handshake header + no padding, which never
+        // matched the sealed payload.)
+        assert_eq!(
+            output.encoded_inner_hello.as_deref(),
+            Some(inner.as_slice()),
+            "encoded_inner_hello must be the exact sealed/decrypted EncodedClientHelloInner"
+        );
     }
 
     #[test]
@@ -2324,11 +2898,16 @@ mod tests {
         let after_cs = after_sid + 2 + cs_len;
         let cm_len = body[after_cs] as usize;
         let after_cm = after_cs + 1 + cm_len;
+        let ext_total_len = u16::from_be_bytes([body[after_cm], body[after_cm + 1]]) as usize;
         let ext_start = after_cm + 2;
+        // Bound by the extensions-length field so trailing ECH padding (zero bytes
+        // after the last extension, present in the sealed EncodedClientHelloInner)
+        // is not misparsed as extra `0x0000` extensions.
+        let ext_end = (ext_start + ext_total_len).min(body.len());
 
         let mut types = Vec::new();
         let mut pos = ext_start;
-        while pos + 4 <= body.len() {
+        while pos + 4 <= ext_end {
             let etype = u16::from_be_bytes([body[pos], body[pos + 1]]);
             let elen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
             types.push(etype);
@@ -2402,8 +2981,8 @@ mod tests {
         );
 
         let mut types = Vec::new();
-        for chunk in payload[1..1 + list_len].chunks_exact(2) {
-            types.push(u16::from_be_bytes([chunk[0], chunk[1]]));
+        for chunk in payload[1..1 + list_len].as_chunks::<2>().0 {
+            types.push(u16::from_be_bytes(*chunk));
         }
         types
     }
@@ -2423,12 +3002,13 @@ mod tests {
         let builder =
             ClientHelloBuilder::new(&profile, "test.example.com").with_ech_config(ech_config_list);
         let output = builder.build().expect("build should succeed");
-        assert!(output.inner_hello.is_some());
+        assert!(output.encoded_inner_hello.is_some());
 
-        let inner = output.inner_hello.unwrap();
-        // inner is a full handshake message (header + body)
-        let inner_body = &inner[4..];
-        let inner_ext_types = extract_extension_types_from_body(inner_body);
+        // The compressed (encoded) inner is the one carrying the 0xFD00 marker.
+        let inner = output.encoded_inner_hello.unwrap();
+        // `encoded_inner_hello` is the sealed EncodedClientHelloInner body: no
+        // Handshake header, empty session_id, trailing ECH padding.
+        let inner_ext_types = extract_extension_types_from_body(&inner);
 
         // 0xFD00 (ech_outer_extensions) must be present in the inner CH
         assert!(
@@ -2474,8 +3054,8 @@ mod tests {
             "outer Chromium CH should have two ordinary GREASE extensions"
         );
 
-        let inner = output.inner_hello.as_ref().expect("inner CH");
-        let referenced_types = extract_ech_outer_extension_types_from_body(&inner[4..]);
+        let inner = output.encoded_inner_hello.as_ref().expect("inner CH");
+        let referenced_types = extract_ech_outer_extension_types_from_body(inner);
         assert_eq!(
             referenced_types.first().copied(),
             outer_grease_types.first().copied(),
@@ -2489,6 +3069,97 @@ mod tests {
         assert!(
             referenced_types.iter().any(|t| !is_grease_value(*t)),
             "real ECH should still reference non-GREASE compressed extensions"
+        );
+    }
+
+    /// Parse the value list of the `supported_versions` (0x002b) extension from a
+    /// ClientHello body (everything after the 4-byte handshake header).
+    fn extract_supported_versions_from_body(body: &[u8]) -> Vec<u16> {
+        let mut pos = 34usize; // version(2) + random(32)
+        let sid = body[pos] as usize;
+        pos += 1 + sid;
+        let cs = u16::from_be_bytes([body[pos], body[pos + 1]]) as usize;
+        pos += 2 + cs;
+        let cm = body[pos] as usize;
+        pos += 1 + cm;
+        pos += 2; // extensions length
+        while pos + 4 <= body.len() {
+            let etype = u16::from_be_bytes([body[pos], body[pos + 1]]);
+            let elen = u16::from_be_bytes([body[pos + 2], body[pos + 3]]) as usize;
+            let data = &body[pos + 4..pos + 4 + elen];
+            if etype == ext_type::SUPPORTED_VERSIONS {
+                // data: 1-byte list length + u16 versions
+                let list_len = data[0] as usize;
+                return data[1..1 + list_len]
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| u16::from_be_bytes(*c))
+                    .collect();
+            }
+            pos += 4 + elen;
+        }
+        Vec::new()
+    }
+
+    /// Regression for two ECH encoding violations that made real
+    /// Cloudflare ECH fail with a fatal `illegal_parameter`:
+    ///   - §5.1: `ech_outer_extensions` referenced ALPS (0x44CD), which the outer
+    ///     omits when there is no `alps_payload` (so the reference dangled).
+    ///   - §6.1: the ClientHelloInner offered TLS 1.2 in `supported_versions`.
+    #[test]
+    fn test_real_ech_inner_refs_present_in_outer_and_inner_is_tls13_only() {
+        let mut profile = presets::chrome_144();
+        // Mirror the real request path's outer when no alps_payload is set:
+        // ALPS is stripped from the emitted outer, yet remains in the profile's
+        // `ech_outer_extensions` compress list.
+        profile.alps_protocols = None;
+        assert!(
+            profile
+                .ech_outer_extensions
+                .as_deref()
+                .unwrap_or(&[])
+                .contains(&0x44CD),
+            "precondition: profile still lists ALPS (0x44CD) in ech_outer_extensions"
+        );
+
+        let ech_config_list = build_test_ech_config_list_with_keypair(0x0001);
+        let output = ClientHelloBuilder::new(&profile, "ech.example.com")
+            .with_ech_config(ech_config_list)
+            .build()
+            .expect("ECH build should succeed");
+
+        let outer_types: std::collections::HashSet<u16> =
+            extract_extension_types_from_body(&output.message[4..])
+                .into_iter()
+                .collect();
+        let inner = output.encoded_inner_hello.as_ref().expect("inner CH");
+        let inner_body = inner.as_slice();
+
+        // §5.1: every referenced extension MUST be present in ClientHelloOuter.
+        let referenced = extract_ech_outer_extension_types_from_body(inner_body);
+        for t in &referenced {
+            assert!(
+                outer_types.contains(t),
+                "ech_outer_extensions references {t:#06x}, absent from ClientHelloOuter"
+            );
+        }
+        // The specific regression: ALPS (old 0x4469 / new 0x44CD) was stripped
+        // from the outer, so it must not be referenced.
+        assert!(
+            !referenced.contains(&0x44CD) && !referenced.contains(&0x4469),
+            "ALPS must not be referenced when absent from the outer; got {referenced:#06x?}"
+        );
+
+        // §6.1: ClientHelloInner MUST NOT offer TLS 1.2 or below.
+        let inner_versions = extract_supported_versions_from_body(inner_body);
+        assert!(
+            inner_versions.contains(&0x0304),
+            "inner must offer TLS 1.3; got {inner_versions:#06x?}"
+        );
+        assert!(
+            !inner_versions.contains(&0x0303),
+            "inner supported_versions must not offer TLS 1.2; got {inner_versions:#06x?}"
         );
     }
 
@@ -2584,6 +3255,92 @@ mod tests {
         assert_eq!(
             shuffled_non_compressed, inner_non_compressed,
             "non-compressed extensions should preserve shuffled relative order"
+        );
+    }
+
+    #[test]
+    fn test_hrr_reuses_extension_order_and_fake_ech_bytes() {
+        let profile = presets::chrome_150();
+        let mut ch1 = ClientHelloBuilder::new(&profile, "example.com")
+            .build()
+            .expect("CH1 build");
+        let random: [u8; 32] = ch1.message[6..38].try_into().unwrap();
+        let sid_len = ch1.message[38] as usize;
+        let session_id = ch1.message[39..39 + sid_len].to_vec();
+        let ch1_types = extract_extension_types_from_body(&ch1.message[4..]);
+        let ch1_ech = extract_extension_body(&ch1.message, ext_type::ENCRYPTED_CLIENT_HELLO)
+            .expect("CH1 fake ECH");
+
+        let ch2 = ClientHelloBuilder::new(&profile, "example.com")
+            .with_random(random)
+            .with_session_id(session_id)
+            .with_grease_values(ch1.grease_values.clone())
+            .with_extension_order(ch1.shuffled_extensions.clone())
+            .with_ech_grease_extension(
+                ch1.ech_grease_extension
+                    .take()
+                    .expect("saved fake ECH extension"),
+            )
+            .build_with_key_pairs(&ch1.key_shares)
+            .expect("CH2 build");
+
+        assert_eq!(
+            extract_extension_types_from_body(&ch2.message[4..]),
+            ch1_types,
+            "HRR must retain the CH1 extension permutation",
+        );
+        assert_eq!(
+            extract_extension_body(&ch2.message, ext_type::ENCRYPTED_CLIENT_HELLO)
+                .expect("CH2 fake ECH"),
+            ch1_ech,
+            "HRR must copy the complete fake ECH extension",
+        );
+    }
+
+    #[test]
+    fn test_real_ech_hrr_reuses_context_and_omits_enc() {
+        let profile = presets::chrome_150();
+        let ech_config_list = build_test_ech_config_list_with_keypair(0x0001);
+        let mut ch1 = ClientHelloBuilder::new(&profile, "secret.example.com")
+            .with_ech_config(ech_config_list.clone())
+            .build()
+            .expect("real ECH CH1");
+        let random: [u8; 32] = ch1.message[6..38].try_into().unwrap();
+        let sid_len = ch1.message[38] as usize;
+        let session_id = ch1.message[39..39 + sid_len].to_vec();
+        let inner_random = ch1.inner_hello.as_ref().unwrap()[6..38].to_vec();
+        let ch1_ech = extract_extension_payload_from_body(
+            &ch1.message[4..],
+            ext_type::ENCRYPTED_CLIENT_HELLO,
+        )
+        .expect("CH1 ECH payload");
+        let mut ech_retry = ch1.ech_retry_state.take().expect("ECH retry state");
+
+        let ch2 = ClientHelloBuilder::new(&profile, "secret.example.com")
+            .with_random(random)
+            .with_session_id(session_id)
+            .with_grease_values(ch1.grease_values.clone())
+            .with_extension_order(ch1.shuffled_extensions.clone())
+            .with_ech_config(ech_config_list)
+            .build_retry_with_key_pairs(&ch1.key_shares, Some(&mut ech_retry))
+            .expect("real ECH CH2");
+        let ch2_ech = extract_extension_payload_from_body(
+            &ch2.message[4..],
+            ext_type::ENCRYPTED_CLIENT_HELLO,
+        )
+        .expect("CH2 ECH payload");
+
+        assert_eq!(&ch2_ech[1..6], &ch1_ech[1..6], "ECH suite/config changed");
+        assert_eq!(u16::from_be_bytes([ch2_ech[6], ch2_ech[7]]), 0);
+        assert_eq!(
+            &ch2.inner_hello.as_ref().unwrap()[6..38],
+            inner_random.as_slice(),
+            "ClientHelloInner.random must remain stable across HRR",
+        );
+        assert_eq!(
+            extract_extension_types_from_body(&ch2.message[4..]),
+            extract_extension_types_from_body(&ch1.message[4..]),
+            "real ECH CH2 must retain the CH1 extension permutation",
         );
     }
 

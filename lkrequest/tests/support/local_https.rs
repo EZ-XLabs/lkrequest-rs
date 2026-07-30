@@ -197,6 +197,27 @@ async fn handle_request(
         }
     }
 
+    // /slow-redirect/{n} — sleeps 300ms then 302-redirects to {n-1}, terminating
+    // at /slow-redirect/0 with 200. Used to verify a total timeout bounds the
+    // whole redirect chain rather than resetting per hop.
+    if let Some(rest) = path.strip_prefix("/slow-redirect/") {
+        if let Ok(n) = rest.parse::<u32>() {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if n == 0 {
+                return Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Full::new(Bytes::from("done")))
+                    .unwrap());
+            }
+            let loc = format!("/slow-redirect/{}", n - 1);
+            return Ok(Response::builder()
+                .status(StatusCode::FOUND)
+                .header(hyper::header::LOCATION, loc)
+                .body(Full::new(Bytes::new()))
+                .unwrap());
+        }
+    }
+
     if let Some(rest) = path.strip_prefix("/bytes/") {
         if let Ok(n) = rest.parse::<usize>() {
             let n = n.min(16 * 1024 * 1024);

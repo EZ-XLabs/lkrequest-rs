@@ -68,9 +68,8 @@ pub fn chrome_146() -> TlsProfile {
 /// This is calibrated from the observed HTTP/3 capture rather than the TCP/H2
 /// profile. QUIC uses TLS 1.3 only, an empty legacy session id, ALPN `h3`, and
 /// carries QUIC transport parameters in extension `0x0039`.
-pub fn chrome_146_quic() -> TlsProfile {
-    let mut profile = chrome_146();
-    profile.name = "Chrome 146 QUIC".to_string();
+fn chromium_quic_profile(mut profile: TlsProfile, name: &str) -> TlsProfile {
+    profile.name = name.to_string();
     profile.tls_min_version = TlsVersion::Tls13;
     profile.tls_max_version = TlsVersion::Tls13;
     // QUIC mandates TLS 1.3, so the ClientHello offers ONLY the three TLS 1.3
@@ -108,6 +107,10 @@ pub fn chrome_146_quic() -> TlsProfile {
     profile
 }
 
+pub fn chrome_146_quic() -> TlsProfile {
+    chromium_quic_profile(chrome_146(), "Chrome 146 QUIC")
+}
+
 /// Load the built-in Chrome 147 profile.
 ///
 /// **Verified (capture)** — the extension order and ECH GREASE payload ranges come from a real Chrome 147
@@ -137,6 +140,28 @@ pub fn chrome_148() -> TlsProfile {
 pub fn chrome_149() -> TlsProfile {
     let json_str = include_str!("../../profiles/chrome_149.json");
     serde_json::from_str(json_str).expect("built-in chrome_149 profile should be valid")
+}
+
+/// Load the built-in Chrome 150 profile.
+///
+/// **Verified (capture)** — captured from real Chrome 150.0.7871.47 via
+/// `profile-collector`. The only wire change vs Chrome 149 is `signature_algorithms`:
+/// Chrome 150 prepends three ML-DSA post-quantum codepoints `0x0904`/`0x0905`/`0x0906`
+/// (2308/2309/2310) ahead of the classic eight. Everything else matches 149 — cipher
+/// suites, groups (incl. X25519MlKem768), key_share, ALPN/ALPS, ECH, and H2/Akamai;
+/// only per-connection extension-order shuffle and random GREASE otherwise differ.
+/// This shifts JA4 (the sig-alg hash) but leaves JA3 unchanged.
+pub fn chrome_150() -> TlsProfile {
+    let json_str = include_str!("../../profiles/chrome_150.json");
+    serde_json::from_str(json_str).expect("built-in chrome_150 profile should be valid")
+}
+
+/// Chrome 150 QUIC ClientHello profile.
+///
+/// Uses Chrome 150's captured TLS capabilities, including the ML-DSA signature
+/// algorithms, while applying Chromium's QUIC-only TLS 1.3 shape.
+pub fn chrome_150_quic() -> TlsProfile {
+    chromium_quic_profile(chrome_150(), "Chrome 150 QUIC")
 }
 
 /// Load the built-in Firefox 133 profile.
@@ -198,6 +223,7 @@ mod tests {
             chrome_147(),
             chrome_148(),
             chrome_149(),
+            chrome_150(),
         ] {
             assert_eq!(
                 profile.tls_client_hello_style,
@@ -247,6 +273,39 @@ mod tests {
         e149.sort_unstable();
         e148.sort_unstable();
         assert_eq!(e149, e148);
+    }
+
+    #[test]
+    fn chrome_150_adds_mldsa_sig_algs_over_149() {
+        // Verified by capturing real Chrome 150.0.7871.47 via profile-collector:
+        // the ONLY wire change vs Chrome 149 is signature_algorithms — Chrome 150
+        // prepends three ML-DSA codepoints 0x0904/0x0905/0x0906 (2308/2309/2310).
+        // Everything else is identical to 149. Lock both facts in so a future
+        // hand-edit can't silently drop the ML-DSA prefix or diverge the rest.
+        let c150 = chrome_150();
+        let c149 = chrome_149();
+        assert_eq!(c150.name, "Chrome 150");
+
+        // The distinguishing change: 3 ML-DSA sig algs in front of 149's list.
+        assert_eq!(
+            c150.signature_algorithms,
+            [&[2308u16, 2309, 2310][..], &c149.signature_algorithms[..]].concat()
+        );
+        assert_ne!(c150.signature_algorithms, c149.signature_algorithms);
+
+        // Everything else matches Chrome 149 on the wire.
+        assert_eq!(c150.cipher_suites, c149.cipher_suites);
+        assert_eq!(c150.supported_groups, c149.supported_groups);
+        assert_eq!(c150.key_share_curves, c149.key_share_curves);
+        assert_eq!(c150.alpn_protocols, c149.alpn_protocols);
+        assert_eq!(c150.alps_protocols, c149.alps_protocols);
+        assert_eq!(c150.compress_cert_algorithms, c149.compress_cert_algorithms);
+        // Same extension SET (per-connection order shuffle aside).
+        let mut e150: Vec<u16> = c150.extensions.iter().map(|e| e.extension_type).collect();
+        let mut e149: Vec<u16> = c149.extensions.iter().map(|e| e.extension_type).collect();
+        e150.sort_unstable();
+        e149.sort_unstable();
+        assert_eq!(e150, e149);
     }
 
     #[test]
@@ -318,6 +377,26 @@ mod tests {
             profile.ech_outer_extensions.as_deref(),
             Some(&[51, 10, 13, 5, 18, 16, 45, 27, 17613][..])
         );
+    }
+
+    #[test]
+    fn chrome_150_quic_uses_chrome_150_signature_algorithms() {
+        let tcp = chrome_150();
+        let quic = chrome_150_quic();
+
+        assert_eq!(quic.name, "Chrome 150 QUIC");
+        assert_eq!(quic.tls_min_version, TlsVersion::Tls13);
+        assert_eq!(quic.tls_max_version, TlsVersion::Tls13);
+        assert_eq!(quic.cipher_suites, vec![0x1301, 0x1302, 0x1303]);
+        assert_eq!(quic.session_id_length, 0);
+        assert_eq!(quic.alpn_protocols, vec!["h3".to_string()]);
+        assert_eq!(quic.alps_protocols, Some(vec!["h3".to_string()]));
+        assert_eq!(
+            &quic.signature_algorithms[..tcp.signature_algorithms.len()],
+            tcp.signature_algorithms.as_slice()
+        );
+        assert_eq!(quic.signature_algorithms.last(), Some(&0x0201));
+        assert_eq!(&quic.signature_algorithms[..3], &[0x0904, 0x0905, 0x0906]);
     }
 
     #[test]

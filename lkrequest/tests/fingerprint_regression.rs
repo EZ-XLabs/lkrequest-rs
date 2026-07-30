@@ -416,5 +416,6 @@ h2_gate! {
 #[cfg(feature = "quic-h3")]
 quic_gate! {
     chrome_146_quic => "chrome_146_quic" => lkh3::chrome_146_quic(),
+    chrome_150_quic => "chrome_150_quic" => lkh3::chrome_150_quic(),
     chrome_generic_quic => "chrome_generic_quic" => lkh3::chrome_quic(),
 }

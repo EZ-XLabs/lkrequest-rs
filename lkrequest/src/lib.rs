@@ -110,6 +110,7 @@ pub mod diagnostics;
 pub mod dns;
 pub mod error;
 pub mod h2;
+pub mod hsts;
 pub mod middleware;
 pub mod multipart;
 pub mod preset;
@@ -140,6 +141,7 @@ pub use error::{
     ConnectionClosedKind, ConnectionError, ConnectionPhase, ProxyError, ProxyErrorKind, QuicError,
     QuicPhase,
 };
+pub use hsts::{DynamicHsts, HstsPolicy, NoHsts, StaticHsts};
 pub use middleware::Middleware;
 pub use preset::ClientPreset;
 pub use protocol::{
@@ -149,6 +151,8 @@ pub use protocol::{
 pub use proxy_pool::{ProxyGuard, ProxyPool};
 #[cfg(feature = "synthetic-fp")]
 pub use randomize::Layers;
+#[cfg(feature = "synthetic-fp")]
+pub use randomize::NegotiabilityFloor;
 pub use randomize::Randomize;
 pub use response::{
     HttpVersion, NegotiatedHttpVersion, RedirectRecord, Response, StreamingResponse,
@@ -162,7 +166,7 @@ pub use session_pool::{
     BadProxyConfig, HealthCheckConfig, SessionGuard, SessionPool, SessionPoolStats,
 };
 pub use tcp_fingerprint::{Ja4tParseError, TcpFingerprint, TcpOption};
-pub use tls::{keylog_to_file, KeyLogCallback, TlsConnector, TlsStream};
+pub use tls::{keylog_to_file, ClientHelloCallback, KeyLogCallback, TlsConnector, TlsStream};
 
 // Profile configuration types
 // TODO: uncomment when these types are implemented in lkh2

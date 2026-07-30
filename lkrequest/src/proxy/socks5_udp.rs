@@ -85,19 +85,15 @@ pub const SOCKS5_UDP_HEADER_IPV4: usize = 10;
 /// Overhead bytes for an IPv6 SOCKS5 UDP header: RSV(2) + FRAG(1) + ATYP(1) + IPv6(16) + PORT(2) = 22
 pub const SOCKS5_UDP_HEADER_IPV6: usize = 22;
 
-/// Encode a SOCKS5 UDP datagram with a `SocksTarget` destination.
-/// Returns the total number of bytes written.
-pub fn encode_socks5_udp_target(
-    target: &SocksTarget,
-    payload: &[u8],
-    out: &mut [u8],
-) -> io::Result<usize> {
+/// Write only the SOCKS5 UDP header (RSV/FRAG/ATYP/DST.ADDR/DST.PORT) for
+/// `target` into `out`, returning the number of header bytes written. The
+/// caller appends the payload (or, when nesting, the next inner frame).
+pub fn write_socks5_udp_header(target: &SocksTarget, out: &mut [u8]) -> io::Result<usize> {
     let hdr_len = socks5_udp_target_header_len(target);
-    let total = hdr_len + payload.len();
-    if out.len() < total {
+    if out.len() < hdr_len {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "output buffer too small for SOCKS5 UDP frame",
+            "output buffer too small for SOCKS5 UDP header",
         ));
     }
 
@@ -128,8 +124,86 @@ pub fn encode_socks5_udp_target(
         }
     }
 
+    Ok(hdr_len)
+}
+
+/// Encode a SOCKS5 UDP datagram with a `SocksTarget` destination.
+/// Returns the total number of bytes written.
+pub fn encode_socks5_udp_target(
+    target: &SocksTarget,
+    payload: &[u8],
+    out: &mut [u8],
+) -> io::Result<usize> {
+    let hdr_len = write_socks5_udp_header(target, out)?;
+    let total = hdr_len + payload.len();
+    if out.len() < total {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "output buffer too small for SOCKS5 UDP frame",
+        ));
+    }
+
     out[hdr_len..total].copy_from_slice(payload);
     Ok(total)
+}
+
+/// Total header overhead (bytes) of a nested SOCKS5 UDP frame: one header per
+/// intermediate relay plus the innermost `target` header. For a single hop
+/// `intermediate` is empty and this equals the plain
+/// [`socks5_udp_target_header_len`].
+#[cfg_attr(not(feature = "quic-h3"), allow(dead_code))]
+pub(crate) fn socks5_udp_nested_header_len(
+    intermediate: &[SocksTarget],
+    target: &SocksTarget,
+) -> usize {
+    intermediate
+        .iter()
+        .map(socks5_udp_target_header_len)
+        .sum::<usize>()
+        + socks5_udp_target_header_len(target)
+}
+
+/// Encode a SOCKS5 UDP datagram nested for a proxy **chain**.
+///
+/// Physical wire layout (what hop1's relay receives):
+///
+/// ```text
+/// [hdr dst=relay2] [hdr dst=relay3] … [hdr dst=relayN] [hdr dst=target] payload
+/// ```
+///
+/// Each hop strips exactly one (outermost) header and forwards the remaining
+/// bytes to that header's DST, so hop `k` forwards to `relay_{k+1}` and the
+/// final hop forwards `payload` to `target`. `intermediate` holds
+/// `relay2..relayN` in order (each an IP address, or a **domain** when the hop
+/// advertised an unspecified BND so the previous hop resolves it in its own
+/// network context); it is empty for a single hop, collapsing this to
+/// [`encode_socks5_udp_target`].
+#[cfg_attr(not(feature = "quic-h3"), allow(dead_code))]
+pub(crate) fn encode_socks5_udp_nested(
+    intermediate: &[SocksTarget],
+    target: &SocksTarget,
+    payload: &[u8],
+    out: &mut [u8],
+) -> io::Result<usize> {
+    let mut off = 0;
+    for hop in intermediate {
+        off += write_socks5_udp_header(hop, &mut out[off..])?;
+    }
+    off += encode_socks5_udp_target(target, payload, &mut out[off..])?;
+    Ok(off)
+}
+
+/// Strip `layers` nested SOCKS5 UDP headers, returning the innermost payload.
+/// `layers` must equal the number of hops (intermediate relays + 1). For a
+/// single hop (`layers == 1`) this is one [`decode_socks5_udp`].
+#[cfg_attr(not(feature = "quic-h3"), allow(dead_code))]
+pub(crate) fn decode_socks5_udp_nested(buf: &[u8], layers: usize) -> io::Result<&[u8]> {
+    let mut cur = buf;
+    for _ in 0..layers {
+        let (_src, payload) = decode_socks5_udp(cur)?;
+        cur = payload;
+    }
+    Ok(cur)
 }
 
 /// Convenience wrapper: encode with a plain `SocketAddr` target (socks5 mode).
@@ -218,14 +292,31 @@ pub fn decode_socks5_udp(buf: &[u8]) -> io::Result<(SocketAddr, &[u8])> {
 /// Return `true` if a UDP packet whose source is `from` was plausibly sent by
 /// the SOCKS5 relay at `relay`.
 ///
+/// Matching is **IP-only** and deliberately ignores the source port. RFC 1928
+/// §7 only tells the *client* where to *send* datagrams (BND.ADDR:BND.PORT); it
+/// says nothing about the source address of the datagrams the relay sends back,
+/// and it never asks the client to verify that source. The "drop datagrams from
+/// an unexpected source" rule in §7 is imposed on the *relay* validating the
+/// *client* — the opposite direction. (No browser faces this at all: Chrome,
+/// Firefox and Safari do not run QUIC over SOCKS5 UDP ASSOCIATE, so there is no
+/// reference behaviour to mirror here — this is a pure interoperability choice.)
+///
+/// In practice many relays answer from a different source *port* than the
+/// BND.PORT they advertised (separate egress socket, relay pools, LB), so
+/// matching the full `ip:port` would silently drop every reply and fail the
+/// whole connection — the concrete cause of QUIC-over-SOCKS5 succeeding on such
+/// proxies with lenient clients (e.g. quic-go stacks) but not here. Matching on
+/// IP keeps a lightweight guard against off-host injection while staying
+/// interoperable; quinn's header protection + AEAD reject forged packets anyway.
+///
 /// When the proxy's BND address is unspecified (e.g. `0.0.0.0:<port>`, which
-/// some servers return to mean "use whatever IP you connected to"), only the
-/// port is compared — the client has no reliable IP to match against.
+/// some servers return to mean "use whatever IP you connected to"), there is no
+/// IP to match against, so only the port is compared.
 pub(crate) fn packet_source_matches_relay(from: SocketAddr, relay: SocketAddr) -> bool {
     if relay.ip().is_unspecified() {
         return from.port() == relay.port();
     }
-    from == relay
+    from.ip() == relay.ip()
 }
 
 pub(crate) fn socks5_udp_target_header_len(target: &SocksTarget) -> usize {
@@ -244,18 +335,29 @@ pub(crate) fn socks5_udp_target_header_len(target: &SocksTarget) -> usize {
 /// A UDP socket that transparently wraps every datagram with SOCKS5 UDP
 /// framing, sending through a relay address obtained via UDP ASSOCIATE.
 ///
-/// The embedded `_control_conn` keeps the SOCKS5 control TCP connection
-/// alive; dropping it invalidates the relay.
+/// Supports a single hop **and** a multi-hop proxy chain: `relay_addr` is the
+/// first hop's relay (the only address datagrams are physically sent to), and
+/// `intermediate_relays` holds `relay2..relayN` — the inner-hop relays whose
+/// addresses are stacked as nested SOCKS5 UDP headers so each hop forwards to
+/// the next. For a single hop `intermediate_relays` is empty.
+///
+/// The embedded `_control_conns` keep every hop's SOCKS5 control TCP connection
+/// alive; dropping any of them invalidates the corresponding relay.
 #[cfg(feature = "quic-h3")]
 pub struct Socks5UdpSocket {
     io: UdpSocket,
     relay_addr: SocketAddr,
+    /// Inner-hop relays (`relay2..relayN`), stacked as nested UDP headers ahead
+    /// of the `target` header. Each is an IP address, or a domain when the hop
+    /// advertised an unspecified BND (the previous hop resolves it). Empty for a
+    /// single hop.
+    intermediate_relays: Vec<SocksTarget>,
     target: SocksTarget,
     /// The address quinn uses for connection tracking.
     /// For IP targets this equals the real address; for domain targets
     /// it is a synthetic placeholder (see `SocksTarget::quinn_addr`).
     quinn_addr: SocketAddr,
-    _control_conn: TcpStream,
+    _control_conns: Vec<TcpStream>,
 }
 
 #[cfg(feature = "quic-h3")]
@@ -273,22 +375,27 @@ impl Socks5UdpSocket {
     /// Create a new adapter.
     ///
     /// * `io` — local UDP socket (already bound)
-    /// * `relay_addr` — the BND address returned by SOCKS5 UDP ASSOCIATE
+    /// * `relay_addr` — the first hop's relay BND address (datagrams are sent here)
+    /// * `intermediate_relays` — inner-hop relays `relay2..relayN` for a proxy
+    ///   chain (IP or domain), stacked as nested headers; empty for a single hop
     /// * `target` — the QUIC peer: IP address (socks5) or domain (socks5h)
-    /// * `control_conn` — the TCP control connection (kept alive for the relay lifetime)
+    /// * `control_conns` — every hop's TCP control connection (kept alive for the
+    ///   relay lifetime)
     pub fn new(
         io: UdpSocket,
         relay_addr: SocketAddr,
+        intermediate_relays: Vec<SocksTarget>,
         target: SocksTarget,
-        control_conn: TcpStream,
+        control_conns: Vec<TcpStream>,
     ) -> Self {
         let quinn_addr = target.quinn_addr();
         Self {
             io,
             relay_addr,
+            intermediate_relays,
             target,
             quinn_addr,
-            _control_conn: control_conn,
+            _control_conns: control_conns,
         }
     }
 
@@ -306,7 +413,7 @@ impl quinn::AsyncUdpSocket for Socks5UdpSocket {
     }
 
     fn try_send(&self, transmit: &udp::Transmit) -> io::Result<()> {
-        let hdr_len = socks5_udp_target_header_len(&self.target);
+        let hdr_len = socks5_udp_nested_header_len(&self.intermediate_relays, &self.target);
         let total = hdr_len + transmit.contents.len();
 
         let mut stack_buf = [0u8; 2048];
@@ -314,11 +421,21 @@ impl quinn::AsyncUdpSocket for Socks5UdpSocket {
             &mut stack_buf[..total]
         } else {
             let mut heap = vec![0u8; total];
-            encode_socks5_udp_target(&self.target, transmit.contents, &mut heap)?;
+            encode_socks5_udp_nested(
+                &self.intermediate_relays,
+                &self.target,
+                transmit.contents,
+                &mut heap,
+            )?;
             return self.io.try_send_to(&heap, self.relay_addr).map(|_| ());
         };
 
-        encode_socks5_udp_target(&self.target, transmit.contents, buf)?;
+        encode_socks5_udp_nested(
+            &self.intermediate_relays,
+            &self.target,
+            transmit.contents,
+            buf,
+        )?;
         self.io
             .try_send_to(&buf[..total], self.relay_addr)
             .map(|_| ())
@@ -339,14 +456,19 @@ impl quinn::AsyncUdpSocket for Socks5UdpSocket {
             let buf = &mut *bufs[0];
             match self.io.try_recv_from(buf) {
                 Ok((n, from)) => {
-                    // RFC 1928 §6: the SOCKS proxy is the only legitimate
-                    // source of UDP responses for this association. Accepting
-                    // packets from any other address would let any host on the
-                    // local network inject forged QUIC datagrams — the AEAD
-                    // layer rejects them eventually but the side effects of
-                    // processing them (state transitions, CONNECTION_CLOSE on
-                    // stateless reset, version negotiation probes) are still
-                    // reachable.
+                    // Only accept UDP responses from the relay host — a
+                    // lightweight guard against another host on the local
+                    // network injecting forged QUIC datagrams. quinn's header
+                    // protection + AEAD reject them eventually, but processing
+                    // them still exposes side effects (state transitions,
+                    // stateless-reset handling, version-negotiation probes).
+                    //
+                    // The match is IP-only, NOT ip:port: RFC 1928 does not
+                    // constrain the source address of relayed replies, and real
+                    // relays frequently answer from a port other than BND.PORT.
+                    // Matching the port too would drop every reply from those
+                    // proxies. See `packet_source_matches_relay` for the full
+                    // rationale.
                     if !packet_source_matches_relay(from, self.relay_addr) {
                         tracing::debug!(
                             from = %from,
@@ -357,8 +479,12 @@ impl quinn::AsyncUdpSocket for Socks5UdpSocket {
                     }
 
                     let data = &buf[..n];
-                    let (_src_addr, payload) = match decode_socks5_udp(data) {
-                        Ok(r) => r,
+                    // Strip one header per hop: the reply arrives with the same
+                    // depth of nesting it was sent with (relayN..relay2 wrap on
+                    // the way back), so `intermediate_relays.len() + 1` layers.
+                    let layers = self.intermediate_relays.len() + 1;
+                    let payload = match decode_socks5_udp_nested(data, layers) {
+                        Ok(p) => p,
                         Err(e) => {
                             tracing::trace!(error = %e, "socks5_udp.decode_skip");
                             continue;
@@ -483,6 +609,81 @@ mod tests {
     }
 
     #[test]
+    fn nested_encode_decode_roundtrip_two_hops() {
+        // A 2-hop chain: hop1 relay forwards to relay2, hop2 relay forwards to
+        // target. Wire layout = [hdr dst=relay2][hdr dst=target] payload.
+        let relay2 = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 1080));
+        let target = SocksTarget::Ip(SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443)));
+        let intermediate = [SocksTarget::Ip(relay2)];
+        let payload = b"nested QUIC";
+
+        let mut buf = [0u8; 128];
+        let n = encode_socks5_udp_nested(&intermediate, &target, payload, &mut buf).unwrap();
+        assert_eq!(
+            n,
+            socks5_udp_nested_header_len(&intermediate, &target) + payload.len()
+        );
+        // Two IPv4 headers.
+        assert_eq!(n, 2 * SOCKS5_UDP_HEADER_IPV4 + payload.len());
+
+        // Outermost header addresses relay2 (what hop1 forwards to).
+        let (outer_dst, inner_frame) = decode_socks5_udp(&buf[..n]).unwrap();
+        assert_eq!(
+            outer_dst,
+            SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 1080))
+        );
+        // The inner frame addresses the real target.
+        let (inner_dst, decoded_payload) = decode_socks5_udp(inner_frame).unwrap();
+        assert_eq!(
+            inner_dst,
+            SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443))
+        );
+        assert_eq!(decoded_payload, payload);
+
+        // The nested stripper peels both layers in one call.
+        let stripped = decode_socks5_udp_nested(&buf[..n], 2).unwrap();
+        assert_eq!(stripped, payload);
+    }
+
+    #[test]
+    fn nested_single_hop_matches_plain_frame() {
+        // Empty `intermediate` collapses to a plain single-header frame.
+        let target = SocksTarget::Ip(SocketAddr::from((Ipv4Addr::LOCALHOST, 443)));
+        let payload = b"one hop";
+        let empty: [SocksTarget; 0] = [];
+        let mut nested = [0u8; 64];
+        let mut plain = [0u8; 64];
+        let n1 = encode_socks5_udp_nested(&empty, &target, payload, &mut nested).unwrap();
+        let n2 = encode_socks5_udp_target(&target, payload, &mut plain).unwrap();
+        assert_eq!(&nested[..n1], &plain[..n2]);
+        assert_eq!(decode_socks5_udp_nested(&nested[..n1], 1).unwrap(), payload);
+    }
+
+    #[test]
+    fn nested_domain_intermediate_roundtrip() {
+        // An inner hop addressed by domain (ATYP=0x03) — used when that hop
+        // returned an unspecified BND, so the previous hop resolves it.
+        let relay2 = SocksTarget::Domain {
+            host: "hop2.internal".into(),
+            port: 1080,
+        };
+        let target = SocksTarget::Ip(SocketAddr::from((Ipv4Addr::new(93, 184, 216, 34), 443)));
+        let intermediate = [relay2];
+        let payload = b"domain nested";
+
+        let mut buf = [0u8; 128];
+        let n = encode_socks5_udp_nested(&intermediate, &target, payload, &mut buf).unwrap();
+        assert_eq!(
+            n,
+            socks5_udp_nested_header_len(&intermediate, &target) + payload.len()
+        );
+        // The outer (inner-hop) header is a domain; peeling both layers yields
+        // the payload.
+        assert_eq!(buf[3], 0x03); // ATYP domain on the outer header
+        assert_eq!(decode_socks5_udp_nested(&buf[..n], 2).unwrap(), payload);
+    }
+
+    #[test]
     fn decode_too_short() {
         assert!(decode_socks5_udp(&[0x00, 0x00, 0x00]).is_err());
     }
@@ -547,15 +748,19 @@ mod tests {
     }
 
     #[test]
-    fn source_match_requires_exact_when_relay_specified() {
+    fn source_match_is_ip_only_when_relay_specified() {
+        // A reply from the relay's IP but a *different* port is accepted: RFC
+        // 1928 does not constrain the source of relayed replies, and real
+        // relays often egress from a port other than BND.PORT. Only a foreign
+        // IP is rejected.
         let relay = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1080));
         let same = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 1080));
+        let same_ip_diff_port = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 9999));
         let wrong_ip = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 2), 1080));
-        let wrong_port = SocketAddr::from((Ipv4Addr::new(10, 0, 0, 1), 9999));
 
         assert!(packet_source_matches_relay(same, relay));
+        assert!(packet_source_matches_relay(same_ip_diff_port, relay));
         assert!(!packet_source_matches_relay(wrong_ip, relay));
-        assert!(!packet_source_matches_relay(wrong_port, relay));
     }
 
     #[test]

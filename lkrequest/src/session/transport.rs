@@ -51,6 +51,12 @@ impl RequestBuilder {
                 super::RedirectPolicy::None
             );
 
+            // One absolute deadline for the *entire* request, shared across
+            // every redirect hop (connect + all hops + body read). This gives a
+            // true total timeout instead of resetting it per hop, which would
+            // make the real worst case (N+1)x the configured value.
+            let deadline = tokio::time::Instant::now() + self.effective_total_timeout();
+
             // Apply query parameters to the URL
             let mut current_url = if self.query_params.is_empty() {
                 self.url.clone()
@@ -73,14 +79,51 @@ impl RequestBuilder {
             let mut redirect_history: Vec<RedirectRecord> = Vec::new();
 
             loop {
+                // HSTS pre-upgrade (RFC 6797 §8.3): rewrite http->https before
+                // connecting, for any host the policy treats as HTTPS-only.
+                // Applies uniformly to the initial URL and every redirect target.
+                if let Some(upgraded) = hsts_upgrade(&current_url, &*self.session.inner.hsts_policy)
+                {
+                    current_url = upgraded;
+                }
+
+                // Opt-in https_only: refuse a non-HTTPS request once HSTS has
+                // had its chance to upgrade. Default off keeps behavior
+                // Chrome-faithful (downgrades are followed).
+                if self.session.inner.https_only {
+                    if let Ok(parsed) = Url::parse(&current_url) {
+                        if parsed.scheme() != "https" {
+                            return Err(Error::Http(format!(
+                                "https_only: refusing non-HTTPS request to {current_url}"
+                            )));
+                        }
+                    }
+                }
+
                 let resp = self
                     .send_single_request(
                         &current_url,
                         &current_method,
                         &current_headers,
                         current_body.clone(),
+                        deadline,
                     )
                     .await?;
+
+                // Learn dynamic HSTS from a Strict-Transport-Security response,
+                // if the policy is stateful (no-op for NoHsts/StaticHsts).
+                if let Some(sts) = resp
+                    .headers()
+                    .get(http::header::STRICT_TRANSPORT_SECURITY)
+                    .and_then(|v| v.to_str().ok())
+                {
+                    if let Some(host) = Url::parse(&current_url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_string))
+                    {
+                        self.session.inner.hsts_policy.record_sts(&host, sts);
+                    }
+                }
 
                 // Check for redirect status codes
                 let status = resp.status();
@@ -122,9 +165,10 @@ impl RequestBuilder {
                     Error::UrlParse(format!("invalid redirect URL '{location}': {e}"))
                 })?;
 
-                // Determine if this is a cross-origin redirect
-                let is_cross_origin = base_url.host_str() != redirect_url.host_str()
-                    || base_url.port_or_known_default() != redirect_url.port_or_known_default();
+                // Origin = scheme + host + port (Fetch "same origin"). Note the
+                // redirect target's https_only / HSTS handling happens at the
+                // top of the next loop iteration, after it becomes current_url.
+                let is_cross_origin = redirect_is_cross_origin(&base_url, &redirect_url);
 
                 tracing::debug!(
                     status = status.as_u16(),
@@ -147,18 +191,24 @@ impl RequestBuilder {
 
                 // Update method and body based on status code
                 match status.as_u16() {
-                    301 | 302 => {
-                        // 301/302: Change method to GET, drop body
+                    301..=303 => {
+                        // 301/302 (historically POST->GET) and 303 See Other:
+                        // follow with GET, drop the body and all request-body
+                        // headers (Fetch "request-body-header name" set). 303 was
+                        // previously not followed at all.
                         current_method = http::Method::GET;
                         current_body = None;
                         current_headers.remove(http::header::CONTENT_TYPE);
                         current_headers.remove(http::header::CONTENT_LENGTH);
+                        current_headers.remove(http::header::CONTENT_ENCODING);
+                        current_headers.remove(http::header::CONTENT_LANGUAGE);
+                        current_headers.remove(http::header::CONTENT_LOCATION);
                     }
                     307 | 308 => {
                         // 307/308: Preserve method and body
                     }
                     _ => {
-                        // Other 3xx codes: return the response as-is
+                        // Other 3xx codes (300/304/305/306): return as-is
                         let mut resp = resp;
                         resp.set_redirect_history(redirect_history);
                         return Ok(resp);
@@ -180,6 +230,14 @@ impl RequestBuilder {
                     self.cookie_overrides.clear();
                 }
 
+                // Chrome (and reqwest) drop the Referer when downgrading the
+                // scheme from https to http, so the secure URL isn't leaked over
+                // cleartext. Independent of cross-origin (same-host downgrade
+                // still strips it).
+                if base_url.scheme() == "https" && redirect_url.scheme() == "http" {
+                    current_headers.remove(http::header::REFERER);
+                }
+
                 // Always remove Cookie so merge_headers_common can rebuild from
                 // the latest jar, explicit request pairs, and `.cookie()` data.
                 // This ensures Set-Cookie responses from intermediate hops are
@@ -193,25 +251,31 @@ impl RequestBuilder {
         })
     }
 
-    /// Send a single HTTP request without redirect following.
+    /// Send a single HTTP request without redirect following, bounded by an
+    /// absolute `deadline`.
     ///
-    /// Applies the total timeout to the entire request cycle.
+    /// The deadline is computed once and shared across the whole redirect chain
+    /// by [`Self::send_with_redirects`], so the total timeout covers connect +
+    /// every hop + body read — not each hop independently. This matches the
+    /// "total timeout" semantics of reqwest, Go's `http.Client.Timeout`, and
+    /// curl's `--max-time`.
     pub(crate) async fn send_single_request(
         &self,
         url: &str,
         method: &http::Method,
         extra_headers: &HeaderMap,
         body: Option<bytes::Bytes>,
+        deadline: tokio::time::Instant,
     ) -> Result<Response> {
-        let total_timeout = self.effective_total_timeout();
-        tokio::time::timeout(
-            total_timeout,
+        tokio::time::timeout_at(
+            deadline,
             self.send_single_request_inner(url, method, extra_headers, body),
         )
         .await
         .map_err(|_| {
+            let total_timeout = self.effective_total_timeout();
             Error::timeout(
-                format!("request timed out after {:?}", total_timeout),
+                format!("request timed out (total deadline of {total_timeout:?} exceeded)"),
                 None,
                 Some(total_timeout),
             )
@@ -2242,6 +2306,40 @@ pub(crate) struct HeaderMergeOrdering<'a> {
 ///
 /// # Cookie merging
 ///
+/// Whether two URLs differ in **origin** (scheme, host, or port).
+///
+/// This is the Fetch "same origin" comparison and is the trigger for stripping
+/// the `Authorization` header on a cross-origin redirect (Fetch §4.4 / Chrome
+/// M112+). Note that a scheme-only change (e.g. an `https`→`http` downgrade on
+/// the same host) counts as cross-origin, because the default port differs and,
+/// explicitly here, the scheme differs.
+pub(crate) fn redirect_is_cross_origin(from: &Url, to: &Url) -> bool {
+    from.scheme() != to.scheme()
+        || from.host_str() != to.host_str()
+        || from.port_or_known_default() != to.port_or_known_default()
+}
+
+/// Apply an HSTS scheme upgrade to `url` if `policy` marks its host HTTPS-only.
+///
+/// Returns the rewritten `https://` URL (with an explicit `:80` bumped to
+/// `:443`, per RFC 6797 §8.3), or `None` if no upgrade applies. Called before
+/// connecting, for both the initial URL and every redirect target.
+fn hsts_upgrade(url: &str, policy: &dyn crate::hsts::HstsPolicy) -> Option<String> {
+    let mut parsed = Url::parse(url).ok()?;
+    if parsed.scheme() != "http" {
+        return None;
+    }
+    let host = parsed.host_str()?.to_string();
+    if !policy.should_upgrade(&host) {
+        return None;
+    }
+    parsed.set_scheme("https").ok()?;
+    if parsed.port() == Some(80) {
+        parsed.set_port(Some(443)).ok()?;
+    }
+    Some(parsed.to_string())
+}
+
 /// Any `Cookie` set on the request (defaults or per-request headers) is taken
 /// as **explicit** pairs. They are sent **first**, and override the session
 /// jar for matching cookie names. Pairs from [`RequestBuilder::cookie`](crate::session::RequestBuilder::cookie)
@@ -2456,6 +2554,39 @@ pub(crate) fn reorder_headers(headers: &mut HeaderMap, order: &[http::header::He
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redirect_cross_origin_trigger_includes_scheme() {
+        let u = |s: &str| Url::parse(s).unwrap();
+
+        // Same origin → not cross-origin.
+        assert!(!redirect_is_cross_origin(
+            &u("https://a.com/x"),
+            &u("https://a.com/y")
+        ));
+        // Different host → cross-origin.
+        assert!(redirect_is_cross_origin(
+            &u("https://a.com/x"),
+            &u("https://b.com/y")
+        ));
+        // Different (default) port via scheme downgrade → cross-origin.
+        assert!(redirect_is_cross_origin(
+            &u("https://a.com/x"),
+            &u("http://a.com/y")
+        ));
+        // Same host+port but scheme differs (explicit equal ports) → still
+        // cross-origin, because the scheme is part of the origin. This is the
+        // case the old host+port-only predicate missed.
+        assert!(redirect_is_cross_origin(
+            &u("https://a.com:8443/x"),
+            &u("http://a.com:8443/y")
+        ));
+        // Different explicit port → cross-origin.
+        assert!(redirect_is_cross_origin(
+            &u("https://a.com/x"),
+            &u("https://a.com:8443/y")
+        ));
+    }
 
     #[test]
     fn test_reorder_headers_basic() {

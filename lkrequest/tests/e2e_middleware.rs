@@ -290,3 +290,43 @@ async fn test_middleware_called_on_every_request() {
     assert_eq!(req_count.load(Ordering::Relaxed), 3);
     assert_eq!(resp_count.load(Ordering::Relaxed), 3);
 }
+
+// ---------------------------------------------------------------------------
+// on_response must still run when a retry policy is configured (regression)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_middleware_on_response_runs_with_retry_policy() {
+    let srv = start_local_https_server().await;
+    let (mw, req_count, resp_count) = CountingMiddleware::new();
+
+    let client = Client::builder()
+        .fingerprint(presets::chrome_144())
+        .h2_profile(chrome_144_h2())
+        .verify(false)
+        .middleware(mw)
+        .build();
+
+    // Dialogue setting retry strategy: It should not prevent successful responses from proceeding through the on_response stage.
+    let session = client
+        .session()
+        .retry_policy(lkrequest::FixedInterval::default())
+        .build();
+
+    let resp = session
+        .get(&url_join(&srv.base_url, "/get"))
+        .send()
+        .await
+        .expect("request");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    assert_eq!(
+        req_count.load(Ordering::Relaxed),
+        1,
+        "on_request Perform once"
+    );
+    assert_eq!(
+        resp_count.load(Ordering::Relaxed),
+        1,
+        "after setting the retry policy, on_response should still be executed once."
+    );
+}

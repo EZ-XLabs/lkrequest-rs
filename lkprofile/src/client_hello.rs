@@ -580,6 +580,90 @@ pub fn build_tls_profile(name: &str, ch: &ParsedClientHello) -> TlsProfile {
     }
 }
 
+/// Round-trip fidelity tests for the ClientHello mirror.
+///
+/// For each browser preset we treat the preset's *encoded* ClientHello as a
+/// stand-in for a real captured one, mirror it (`parse_client_hello` →
+/// `build_tls_profile`), re-encode the mirror, and compare TLS fingerprints. A
+/// faithful mirror must reproduce the same JA3 / JA3N / JA4. This is the test
+/// the audit flagged as missing — it empirically measures whether the
+/// "semantic re-synthesis" (Generic style + Auto-regenerated extensions)
+/// preserves the fingerprint, including for non-Chrome families.
+#[cfg(test)]
+mod mirror_roundtrip {
+    use super::{build_tls_profile, parse_client_hello};
+    use crate::fingerprint::{collect_tls_fingerprint, TlsFingerprintCollection};
+    use lktls::handshake::client_hello::ClientHelloBuilder;
+    use lktls::profile::types::TlsProfile;
+
+    fn encode_and_fingerprint(profile: &TlsProfile) -> TlsFingerprintCollection {
+        let out = ClientHelloBuilder::new(profile, "example.com")
+            .build()
+            .expect("encode ClientHello");
+        // `out.message` is the handshake message (no record header);
+        // `parse_client_hello` accepts that directly.
+        let parsed = parse_client_hello(&out.message).expect("parse encoded ClientHello");
+        collect_tls_fingerprint(&parsed)
+    }
+
+    /// Returns `Err(diagnostic)` if the mirror round-trip changed the fingerprint;
+    /// the caller asserts so each `#[test]` carries an explicit assertion.
+    fn mirror_fingerprint_diff(name: &str, profile: TlsProfile) -> Result<(), String> {
+        // 1. Encode the preset as a stand-in for a captured real ClientHello.
+        let out = ClientHelloBuilder::new(&profile, "example.com")
+            .build()
+            .expect("encode original ClientHello");
+        let parsed_orig = parse_client_hello(&out.message).expect("parse original");
+        let fp_orig = collect_tls_fingerprint(&parsed_orig);
+
+        // 2. Mirror it, then re-encode + fingerprint the mirror.
+        let mirror = build_tls_profile("mirror", &parsed_orig);
+        let fp_mirror = encode_and_fingerprint(&mirror);
+
+        // JA3N (normalized: extensions sorted) — proves the mirror preserved the
+        // cipher list, extension SET, groups and ec-point formats.
+        if fp_orig.ja3n_hash != fp_mirror.ja3n_hash {
+            return Err(format!(
+                "[{name}] JA3N differs (semantic loss):\n  orig:   {}\n  mirror: {}",
+                fp_orig.ja3n_text, fp_mirror.ja3n_text
+            ));
+        }
+        // JA4 prefix (version, cipher/ext counts, ALPN).
+        if fp_orig.ja4_prefix != fp_mirror.ja4_prefix {
+            return Err(format!("[{name}] JA4 prefix differs"));
+        }
+        // JA3 (order-sensitive) — the mirror keeps the captured extension order
+        // (randomization disabled), so a mismatch here pinpoints an extension
+        // ORDER or per-extension byte-encoding discrepancy under the mirror's
+        // Generic style / Auto-regeneration.
+        if fp_orig.ja3_hash != fp_mirror.ja3_hash {
+            return Err(format!(
+                "[{name}] JA3 differs (order / byte-encoding):\n  orig:   {}\n  mirror: {}",
+                fp_orig.ja3_text, fp_mirror.ja3_text
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mirror_preserves_chrome_144() {
+        let result = mirror_fingerprint_diff("chrome_144", lktls::profile::presets::chrome_144());
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+
+    #[test]
+    fn mirror_preserves_firefox_147() {
+        let result = mirror_fingerprint_diff("firefox_147", lktls::profile::presets::firefox_147());
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+
+    #[test]
+    fn mirror_preserves_safari_26() {
+        let result = mirror_fingerprint_diff("safari_26", lktls::profile::presets::safari_26());
+        assert!(result.is_ok(), "{}", result.unwrap_err());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

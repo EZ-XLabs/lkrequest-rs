@@ -83,6 +83,7 @@ impl QuicConstraints {
             bases: vec![
                 crate::profile::chrome_quic(),
                 crate::profile::chrome_146_quic(),
+                crate::profile::chrome_150_quic(),
             ],
         }
     }
@@ -167,6 +168,7 @@ mod tests {
         vec![
             ("chrome_quic", crate::profile::chrome_quic()),
             ("chrome_146_quic", crate::profile::chrome_146_quic()),
+            ("chrome_150_quic", crate::profile::chrome_150_quic()),
         ]
     }
 

@@ -29,7 +29,7 @@ use lktls::record::reader::RecordReader;
 use lktls::record::writer::RecordWriter;
 use lktls::session_store::SessionStore;
 use lktls::verify::policy::VerificationPolicy;
-use lktls::KeyLogCallback;
+use lktls::{ClientHelloCallback, KeyLogCallback};
 
 /// Trait alias for stream types accepted by [`TlsConnector::connect`].
 pub trait TlsTransport: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -77,6 +77,7 @@ impl TlsConnector {
                 ech_config_list: None,
                 custom_ca_anchors: None,
                 keylog_callback: None,
+                client_hello_callback: None,
             },
         }
     }
@@ -129,6 +130,13 @@ impl TlsConnector {
         self
     }
 
+    /// Observes the raw ClientHello bytes about to be sent on the wire (the exact
+    /// outbound fingerprint), without affecting the handshake.
+    pub fn on_client_hello(mut self, callback: ClientHelloCallback) -> Self {
+        self.config.client_hello_callback = Some(callback);
+        self
+    }
+
     pub async fn connect_tcp(
         &self,
         hostname: &str,
@@ -164,11 +172,29 @@ impl TlsConnector {
 
             let mut driver = HandshakeDriver::new(config);
 
+            // `driver.start()` fires `client_hello_callback` (set via
+            // `on_client_hello`) internally, so the same hook works for direct
+            // lktls users — see `HandshakeDriver::start`.
             let ch_bytes = driver.start()?;
             stream.write_all(&ch_bytes).await.map_err(TlsError::Io)?;
 
             loop {
-                match driver.progress()? {
+                let output = match driver.progress() {
+                    Ok(output) => output,
+                    Err(error) => {
+                        if let Some(alert) = driver.take_pending_alert() {
+                            if let Err(write_error) = stream.write_all(&alert).await {
+                                tracing::debug!(
+                                    error = %write_error,
+                                    "tls.local_alert_send_failed"
+                                );
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
+
+                match output {
                     HandshakeOutput::SendData(data) => {
                         stream.write_all(&data).await.map_err(TlsError::Io)?;
                     }
@@ -209,6 +235,8 @@ pub struct TlsStream<S: TlsTransport = TcpStream> {
     closed: bool,
     negotiated_alpn: Option<String>,
     negotiated_cipher_suite: Option<u16>,
+    negotiated_version: Option<u16>,
+    peer_certificates: Vec<Vec<u8>>,
     post_handshake: Option<PostHandshakeState>,
     session_ticket_ctx: Option<SessionTicketContext>,
 }
@@ -235,6 +263,8 @@ impl<S: TlsTransport> TlsStream<S> {
             closed: false,
             negotiated_alpn: result.negotiated_alpn,
             negotiated_cipher_suite: result.negotiated_cipher_suite,
+            negotiated_version: result.negotiated_version,
+            peer_certificates: result.peer_certificates,
             post_handshake: result.post_handshake,
             session_ticket_ctx: result.session_ticket_ctx,
         }
@@ -250,6 +280,17 @@ impl<S: TlsTransport> TlsStream<S> {
 
     pub fn negotiated_cipher_suite(&self) -> Option<u16> {
         self.negotiated_cipher_suite
+    }
+
+    /// Negotiated TLS version (0x0303 = TLS 1.2, 0x0304 = TLS 1.3), if known.
+    pub fn negotiated_version(&self) -> Option<u16> {
+        self.negotiated_version
+    }
+
+    /// The server's certificate chain (DER, leaf first). Empty on a resumed
+    /// handshake that carried no Certificate message.
+    pub fn peer_certificates(&self) -> &[Vec<u8>] {
+        &self.peer_certificates
     }
 
     fn handle_post_handshake(&mut self, payload: &[u8]) -> io::Result<()> {

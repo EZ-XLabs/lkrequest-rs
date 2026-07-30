@@ -147,7 +147,8 @@ impl WsBuilder {
             tls_profile.alpn_protocols =
                 crate::session::pipeline::alpn_for_h1_only(&tls_profile.alpn_protocols);
 
-            let connect_config = crate::connect::ConnectConfig::https(tls_profile, Vec::new());
+            // H1-only WebSocket upgrade path ⇒ no ALPS.
+            let connect_config = crate::connect::ConnectConfig::https(tls_profile, None);
 
             let conn = session
                 .establish_connection(&host, port, session.inner.proxy.as_ref(), &connect_config)

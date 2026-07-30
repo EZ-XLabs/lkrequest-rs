@@ -285,14 +285,29 @@ fn parse_der_tl(data: &[u8]) -> Result<(u8, usize, usize)> {
 
 /// Skip one DER element, returning (element_total_bytes, remaining_data).
 fn skip_der_element(data: &[u8]) -> Result<(usize, &[u8])> {
-    let (_tag, content_start, content_len) = parse_der_tl(data)?;
-    let total = content_start + content_len;
+    let (_tag, _content, total) = parse_der_element(data)?;
+    Ok((total, &data[total..]))
+}
+
+/// Parse one DER element and return `(tag, content_slice, element_total_bytes)`,
+/// validating that the declared content length actually fits within `data`.
+///
+/// Unlike the raw [`parse_der_tl`] (which only reads the length *field*), this
+/// guarantees the returned content slice is in bounds, so it is safe to call on
+/// attacker-controlled certificate bytes. A declared length that overruns the
+/// buffer (or overflows `usize`) yields a `CertificateError` instead of an
+/// out-of-bounds slice panic.
+fn parse_der_element(data: &[u8]) -> Result<(u8, &[u8], usize)> {
+    let (tag, content_start, content_len) = parse_der_tl(data)?;
+    let total = content_start
+        .checked_add(content_len)
+        .ok_or_else(|| TlsError::CertificateError("DER: length overflow".to_string()))?;
     if total > data.len() {
         return Err(TlsError::CertificateError(
             "DER: element extends past end of data".to_string(),
         ));
     }
-    Ok((total, &data[total..]))
+    Ok((tag, &data[content_start..total], total))
 }
 
 /// Extract the SubjectPublicKeyInfo (SPKI) from a DER-encoded X.509 certificate.
@@ -309,13 +324,12 @@ pub(crate) fn extract_spki_from_cert(cert_der: &[u8]) -> Result<&[u8]> {
     let cert_content = &cert_der[content_start..];
 
     // Parse TBSCertificate SEQUENCE (first element of Certificate)
-    let (tag, tbs_content_start, tbs_content_len) = parse_der_tl(cert_content)?;
+    let (tag, tbs, _tbs_total) = parse_der_element(cert_content)?;
     if tag != 0x30 {
         return Err(TlsError::CertificateError(
             "TBSCertificate: expected SEQUENCE".to_string(),
         ));
     }
-    let tbs = &cert_content[tbs_content_start..tbs_content_start + tbs_content_len];
 
     // Navigate TBSCertificate fields:
     // 1. version [0] EXPLICIT (optional)
@@ -352,8 +366,7 @@ pub(crate) fn extract_spki_from_cert(cert_der: &[u8]) -> Result<&[u8]> {
         ));
     }
 
-    let (_tag, spki_content_start, spki_content_len) = parse_der_tl(remaining)?;
-    let spki_total = spki_content_start + spki_content_len;
+    let (_tag, _spki_content, spki_total) = parse_der_element(remaining)?;
     Ok(&remaining[..spki_total])
 }
 
@@ -375,14 +388,13 @@ fn extract_rsa_public_key_from_spki(spki: &[u8]) -> Result<&[u8]> {
     let (_total, remaining) = skip_der_element(content)?;
 
     // Parse BIT STRING
-    let (tag, bs_content_start, bs_content_len) = parse_der_tl(remaining)?;
+    let (tag, bs_content, _bs_total) = parse_der_element(remaining)?;
     if tag != 0x03 {
         return Err(TlsError::CertificateError(
             "SPKI: expected BIT STRING for public key".to_string(),
         ));
     }
 
-    let bs_content = &remaining[bs_content_start..bs_content_start + bs_content_len];
     if bs_content.is_empty() {
         return Err(TlsError::CertificateError(
             "SPKI: empty BIT STRING".to_string(),
@@ -636,6 +648,39 @@ mod tests {
         ];
         let result = extract_rsa_public_key_from_spki(&data);
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // Malicious-certificate DER bounds (must error, never panic)
+    //
+    // A hostile server is the source of these bytes; an out-of-bounds slice
+    // here is a remotely-triggerable panic (DoS) on the default Strict path,
+    // where `verify_certificate_verify` parses the leaf SPKI *before* webpki
+    // validates the chain.
+    // ========================================================================
+
+    #[test]
+    fn extract_spki_rejects_oversized_tbs_length_without_panic() {
+        // Outer Certificate SEQUENCE declares 0xFFFF content bytes and the
+        // inner TBSCertificate SEQUENCE also declares 0xFFFF — both far beyond
+        // the 10-byte buffer. The TBS slice must be bounds-checked.
+        let malicious = [0x30, 0x82, 0xFF, 0xFF, 0x30, 0x82, 0xFF, 0xFF, 0x00, 0x01];
+        let result = extract_spki_from_cert(&malicious);
+        assert!(result.is_err(), "expected error, got {result:?}");
+    }
+
+    #[test]
+    fn extract_rsa_pubkey_rejects_oversized_bitstring_without_panic() {
+        // SPKI = SEQUENCE { AlgorithmIdentifier, BIT STRING } where the BIT
+        // STRING declares 0xFFFF bytes but only 0 are present. The BIT STRING
+        // content slice must be bounds-checked.
+        let spki = [
+            0x30, 0x08, // SPKI SEQUENCE, 8 content bytes
+            0x30, 0x02, 0x05, 0x00, // AlgorithmIdentifier SEQUENCE { NULL }
+            0x03, 0x82, 0xFF, 0xFF, // BIT STRING, declared length 0xFFFF
+        ];
+        let result = extract_rsa_public_key_from_spki(&spki);
+        assert!(result.is_err(), "expected error, got {result:?}");
     }
 
     // ========================================================================

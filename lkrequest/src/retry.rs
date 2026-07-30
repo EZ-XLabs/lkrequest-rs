@@ -4,6 +4,20 @@
 //! failed requests based on error type, HTTP status code, and configurable
 //! backoff timing.
 //!
+//! # Replay safety (idempotency)
+//!
+//! A retry re-sends the (buffered) request body, so error-based retries are
+//! gated on whether the request is safe to replay — the policy decides the
+//! backoff, [`retry_is_replay_safe`] decides whether a replay is allowed at
+//! all. Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) are always retried;
+//! non-idempotent methods (`POST`/`PUT`/`PATCH`/`DELETE`) are retried only
+//! when the failure proves the request was never processed
+//! (connection-establishment failures, HTTP/2 `REFUSED_STREAM`), or when the
+//! request is explicitly marked [`Idempotency::Idempotent`](crate::Idempotency).
+//! This prevents a timeout/reset *after* a `POST` was sent from silently
+//! duplicating a side effect. Retryable status-code responses (429/502/503/…)
+//! are retried regardless of method.
+//!
 //! # Built-in Strategies
 //!
 //! - [`ExponentialBackoff`]: Doubles the delay between retries (with jitter).
@@ -68,6 +82,40 @@ pub trait RetryPolicy: Send + Sync + std::fmt::Debug {
 /// - 520-530 Cloudflare custom errors
 pub fn is_retryable_status(status: http::StatusCode) -> bool {
     matches!(status.as_u16(), 429 | 502 | 503 | 520..=530)
+}
+
+// ---------------------------------------------------------------------------
+// Replay safety (idempotency-aware retry gate)
+// ---------------------------------------------------------------------------
+
+/// Whether a request that failed with `error` is safe to **auto-retry** given
+/// its HTTP method and idempotency setting.
+///
+/// A retry re-sends the (fully buffered) request body, so a non-idempotent
+/// request — `POST`/`PUT`/`PATCH`/`DELETE`, or any custom non-safe method —
+/// must only be retried when **either**:
+///
+/// - the failure proves the server never processed the request
+///   ([`Error::is_safe_to_replay`]: connection-establishment failures and
+///   HTTP/2 `REFUSED_STREAM`); or
+/// - the caller has declared the request replay-safe via
+///   [`Idempotency::Idempotent`](crate::Idempotency) (e.g. it carries an
+///   `Idempotency-Key` header).
+///
+/// Safe methods (`GET`/`HEAD`/`OPTIONS`/`TRACE`) are always replay-safe. This
+/// mirrors Chromium's transaction-restart rules and reqwest's behaviour: a
+/// timeout or connection reset that occurs *after* a `POST` was transmitted is
+/// not auto-retried, because the server may already have applied it and a
+/// silent replay would duplicate the side effect.
+///
+/// The [`RetryPolicy`] still decides *whether and how long* to back off; this
+/// gate is an additional safety check applied to the error-retry path.
+pub fn retry_is_replay_safe(
+    method: &http::Method,
+    idempotency: crate::session::Idempotency,
+    error: &Error,
+) -> bool {
+    error.is_safe_to_replay() || crate::session::can_send_early_data(method, idempotency)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +374,76 @@ mod tests {
         assert_eq!(d2, Duration::from_millis(500));
 
         assert!(policy.should_retry(3, Some(&timeout_error), None).is_none());
+    }
+
+    #[test]
+    fn poc_non_idempotent_post_not_replayed_after_post_send_failure() {
+        use crate::error::{ConnectionClosedKind, ConnectionError, ConnectionPhase};
+        use crate::session::Idempotency;
+
+        // A response timeout can fire *after* the request bytes were
+        // transmitted — the server may already have processed the POST. The
+        // backoff policy alone (the only pre-fix gatekeeper) treats it as
+        // retryable, which is exactly how the duplicate-POST bug arose:
+        let policy = ExponentialBackoff::default();
+        let post_send = Error::timeout("response timeout", None, None);
+        assert!(
+            policy.should_retry(1, Some(&post_send), None).is_some(),
+            "baseline: the backoff policy alone treats a timeout as retryable",
+        );
+
+        // ...but replaying a POST risks a duplicate side effect, so the replay
+        // gate must refuse it.
+        assert!(
+            !retry_is_replay_safe(&http::Method::POST, Idempotency::Default, &post_send),
+            "POST must not be auto-replayed after a possibly-processed failure",
+        );
+
+        // Safe methods (RFC 9110 §9.2.1) are always replay-safe.
+        assert!(retry_is_replay_safe(
+            &http::Method::GET,
+            Idempotency::Default,
+            &post_send
+        ));
+
+        // An explicit replay guard (e.g. an Idempotency-Key) opts a POST in.
+        assert!(retry_is_replay_safe(
+            &http::Method::POST,
+            Idempotency::Idempotent,
+            &post_send
+        ));
+
+        // A failure that proves the request was never processed is replay-safe
+        // for any method — pre-send connection failure...
+        let pre_send = Error::Connection(Box::new(ConnectionError {
+            phase: ConnectionPhase::TcpConnect,
+            message: "connection refused".into(),
+            source: None,
+        }));
+        assert!(retry_is_replay_safe(
+            &http::Method::POST,
+            Idempotency::Default,
+            &pre_send
+        ));
+
+        // ...and HTTP/2 REFUSED_STREAM (declined before processing).
+        let refused = Error::ConnectionClosed {
+            phase: ConnectionPhase::HttpRequest,
+            kind: ConnectionClosedKind::RefusedStream,
+            message: "refused stream".into(),
+        };
+        assert!(retry_is_replay_safe(
+            &http::Method::POST,
+            Idempotency::Default,
+            &refused
+        ));
+
+        // An explicit opt-out is never replayed on a post-send failure.
+        assert!(!retry_is_replay_safe(
+            &http::Method::DELETE,
+            Idempotency::NotIdempotent,
+            &post_send
+        ));
     }
 
     #[test]

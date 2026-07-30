@@ -8,7 +8,7 @@
 //! - Selected key share group + public key (for TLS 1.3)
 //! - HelloRetryRequest detection (via special random value)
 
-use crate::error::{Result, TlsError};
+use crate::error::{AlertDescription, Result, TlsError};
 
 /// The special ServerHello.random value that indicates a HelloRetryRequest
 /// (RFC 8446 Section 4.1.3).
@@ -52,6 +52,8 @@ pub struct ServerHelloExtensions {
     /// Selected PSK identity index (from `pre_shared_key` extension).
     /// Present when the server accepts a PSK offered in the ClientHello.
     pub selected_psk_identity: Option<u16>,
+    /// ECH acceptance confirmation carried by HelloRetryRequest.
+    pub ech_confirmation: Option<[u8; 8]>,
 }
 
 impl ServerHello {
@@ -135,10 +137,28 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
 
     // Extensions
     let mut extensions = ServerHelloExtensions::default();
+    let mut seen_hrr_extensions = Vec::new();
     if pos + 2 <= data.len() {
         let ext_total = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
         pos += 2;
-        let ext_end = (pos + ext_total).min(data.len());
+        let ext_end = pos.checked_add(ext_total).ok_or_else(|| {
+            TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "ServerHello extensions length overflow",
+            )
+        })?;
+        if ext_end > data.len() {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "ServerHello extensions exceed message length",
+            ));
+        }
+        if is_hello_retry_request && ext_end != data.len() {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "HelloRetryRequest has trailing bytes after extensions",
+            ));
+        }
 
         while pos + 4 <= ext_end {
             let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
@@ -146,26 +166,49 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
             pos += 4;
 
             if pos + ext_len > ext_end {
-                break;
+                return Err(TlsError::local_alert(
+                    AlertDescription::DecodeError,
+                    "ServerHello extension exceeds extensions block",
+                ));
             }
             let ext_data = &data[pos..pos + ext_len];
             pos += ext_len;
 
+            if is_hello_retry_request {
+                if seen_hrr_extensions.contains(&ext_type) {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::IllegalParameter,
+                        format!("duplicate HelloRetryRequest extension 0x{ext_type:04x}"),
+                    ));
+                }
+                seen_hrr_extensions.push(ext_type);
+            }
+
             match ext_type {
                 // supported_versions (0x002b)
-                0x002b if ext_data.len() >= 2 => {
+                0x002b if ext_data.len() == 2 => {
                     extensions.supported_version =
                         Some(u16::from_be_bytes([ext_data[0], ext_data[1]]));
+                }
+                0x002b if is_hello_retry_request => {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::DecodeError,
+                        "HRR supported_versions must be exactly 2 bytes",
+                    ));
                 }
 
                 // key_share (0x0033)
                 0x0033 => {
                     if is_hello_retry_request {
                         // HRR key_share only contains the selected group (2 bytes)
-                        if ext_data.len() >= 2 {
-                            extensions.selected_group =
-                                Some(u16::from_be_bytes([ext_data[0], ext_data[1]]));
+                        if ext_data.len() != 2 {
+                            return Err(TlsError::local_alert(
+                                AlertDescription::DecodeError,
+                                "HRR key_share must contain exactly one selected group",
+                            ));
                         }
+                        extensions.selected_group =
+                            Some(u16::from_be_bytes([ext_data[0], ext_data[1]]));
                     } else {
                         // Normal ServerHello key_share: group (2) + key_len (2) + key
                         if ext_data.len() >= 4 {
@@ -180,24 +223,74 @@ pub fn parse_server_hello(data: &[u8]) -> Result<ServerHello> {
                 }
 
                 // cookie (0x002c) — only in HRR
-                0x002c if ext_data.len() >= 2 => {
+                0x002c if is_hello_retry_request && ext_data.len() >= 2 => {
                     let cookie_len = u16::from_be_bytes([ext_data[0], ext_data[1]]) as usize;
-                    if 2 + cookie_len <= ext_data.len() {
-                        extensions.cookie = Some(ext_data[2..2 + cookie_len].to_vec());
+                    if 2 + cookie_len != ext_data.len() {
+                        return Err(TlsError::local_alert(
+                            AlertDescription::DecodeError,
+                            "HRR cookie length does not match extension length",
+                        ));
                     }
+                    extensions.cookie = Some(ext_data[2..].to_vec());
+                }
+                0x002c if is_hello_retry_request => {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::DecodeError,
+                        "HRR cookie extension is too short",
+                    ));
                 }
 
                 // pre_shared_key (0x0029) — selected PSK identity
+                0x0029 if is_hello_retry_request => {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::UnsupportedExtension,
+                        "pre_shared_key is not permitted in HelloRetryRequest",
+                    ));
+                }
                 0x0029 if ext_data.len() >= 2 => {
                     extensions.selected_psk_identity =
                         Some(u16::from_be_bytes([ext_data[0], ext_data[1]]));
                 }
 
+                // encrypted_client_hello (0xFE0D) — HRR accept confirmation
+                0xFE0D if is_hello_retry_request && ext_data.len() == 8 => {
+                    extensions.ech_confirmation = Some(
+                        ext_data
+                            .try_into()
+                            .expect("ECH HRR confirmation has fixed length"),
+                    );
+                }
+                0xFE0D if is_hello_retry_request => {
+                    return Err(TlsError::local_alert(
+                        AlertDescription::DecodeError,
+                        "HRR ECH confirmation must be exactly 8 bytes",
+                    ));
+                }
+
                 _ => {
-                    // Ignore unknown extensions
+                    if is_hello_retry_request {
+                        return Err(TlsError::local_alert(
+                            AlertDescription::UnsupportedExtension,
+                            format!(
+                                "extension 0x{ext_type:04x} is not permitted in HelloRetryRequest"
+                            ),
+                        ));
+                    }
                 }
             }
         }
+
+        if is_hello_retry_request && pos != ext_end {
+            return Err(TlsError::local_alert(
+                AlertDescription::DecodeError,
+                "truncated HelloRetryRequest extension header",
+            ));
+        }
+    } else if is_hello_retry_request {
+        return Err(TlsError::local_alert(
+            AlertDescription::MissingExtension,
+            "HelloRetryRequest missing extensions",
+        ));
     }
 
     Ok(ServerHello {
@@ -360,6 +453,18 @@ mod tests {
         data
     }
 
+    fn build_test_hrr(extensions: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0x0303u16.to_be_bytes());
+        data.extend_from_slice(&HRR_RANDOM);
+        data.push(0);
+        data.extend_from_slice(&0x1301u16.to_be_bytes());
+        data.push(0);
+        data.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        data.extend_from_slice(extensions);
+        data
+    }
+
     #[test]
     fn test_parse_tls13_server_hello() {
         let random = [0xAA; 32];
@@ -418,6 +523,11 @@ mod tests {
         data.extend_from_slice(&(cookie_data.len() as u16).to_be_bytes());
         data.extend_from_slice(cookie_data);
 
+        // encrypted_client_hello HRR accept confirmation
+        let ech_confirmation = [1, 2, 3, 4, 5, 6, 7, 8];
+        data.extend_from_slice(&[0xfe, 0x0d, 0x00, 0x08]);
+        data.extend_from_slice(&ech_confirmation);
+
         let ext_total = data.len() - ext_data_start;
         data[ext_start] = ((ext_total >> 8) & 0xff) as u8;
         data[ext_start + 1] = (ext_total & 0xff) as u8;
@@ -430,8 +540,36 @@ mod tests {
             sh.extensions.cookie.as_deref(),
             Some(cookie_data.as_slice())
         );
+        assert_eq!(sh.extensions.ech_confirmation, Some(ech_confirmation));
         // HRR should NOT have a full key_share
         assert!(sh.extensions.key_share.is_none());
+    }
+
+    #[test]
+    fn test_hrr_rejects_duplicate_extension() {
+        let extensions = [
+            0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04,
+        ];
+        let error = parse_server_hello(&build_test_hrr(&extensions)).unwrap_err();
+        assert!(error.to_string().contains("duplicate HelloRetryRequest"));
+    }
+
+    #[test]
+    fn test_hrr_rejects_unknown_extension() {
+        let extensions = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0x12, 0x34, 0x00, 0x00];
+        let error = parse_server_hello(&build_test_hrr(&extensions)).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("not permitted in HelloRetryRequest"));
+    }
+
+    #[test]
+    fn test_hrr_rejects_invalid_ech_confirmation_length() {
+        let extensions = [
+            0x00, 0x2b, 0x00, 0x02, 0x03, 0x04, 0xfe, 0x0d, 0x00, 0x07, 1, 2, 3, 4, 5, 6, 7,
+        ];
+        let error = parse_server_hello(&build_test_hrr(&extensions)).unwrap_err();
+        assert!(error.to_string().contains("exactly 8 bytes"));
     }
 
     #[test]

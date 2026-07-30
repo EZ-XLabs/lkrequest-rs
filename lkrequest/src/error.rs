@@ -427,6 +427,36 @@ impl Error {
         ) || matches!(self, Error::Status { status, .. } if status.is_server_error())
     }
 
+    /// `true` if this error proves the request was **not processed** by the
+    /// origin server, so re-sending it cannot duplicate a side effect — even
+    /// for a non-idempotent method such as `POST`/`PUT`/`PATCH`/`DELETE`.
+    ///
+    /// This is a strict subset of [`Self::is_retryable`]. It covers:
+    /// - failures during connection establishment (DNS/TCP/proxy/TLS/QUIC
+    ///   handshake), where the request bytes were never written; and
+    /// - HTTP/2 `REFUSED_STREAM`, where the server explicitly declined the
+    ///   stream before processing it.
+    ///
+    /// Ambiguous post-transmission failures — a response timeout, a mid-stream
+    /// reset, a GOAWAY after the stream opened, or a 5xx status — are
+    /// deliberately excluded: the server may already have applied the request,
+    /// so those are only retried for idempotent/safe requests. The retry
+    /// pipeline combines this with the request's method/idempotency via
+    /// [`crate::retry::retry_is_replay_safe`].
+    pub fn is_safe_to_replay(&self) -> bool {
+        match self {
+            // Connection establishment failed before the request was sent.
+            Error::Tls(_) | Error::Proxy(_) | Error::QuicHandshake(_) => true,
+            Error::QuicTransport(e) => e.phase == QuicPhase::Handshake,
+            Error::Connection(c) => !matches!(c.phase, ConnectionPhase::HttpRequest),
+            // The server refused the stream before processing the request.
+            Error::ConnectionClosed { kind, .. } => {
+                matches!(kind, ConnectionClosedKind::RefusedStream)
+            }
+            _ => false,
+        }
+    }
+
     /// `true` if the error is a QUIC-handshake / connect-time failure that
     /// justifies marking the origin as broken-QUIC and falling back to H2.
     ///

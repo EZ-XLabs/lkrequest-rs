@@ -1,4 +1,4 @@
-//! ECHConfigList binary parser (draft-ietf-tls-esni-24 Section 4).
+//! ECHConfigList binary parser (RFC 9849 Section 4).
 //!
 //! Parses the wire-format ECHConfigList (obtained from DNS HTTPS records,
 //! `ech_retry_configs`, or manual configuration) into structured [`EchConfig`]
@@ -22,7 +22,7 @@ pub struct HpkeSymmetricCipherSuite {
 /// A parsed ECHConfig structure.
 #[derive(Debug, Clone)]
 pub struct EchConfig {
-    /// ECH version (must be 0xFE0D for the current draft).
+    /// ECH version (0xFE0D for RFC 9849).
     pub version: u16,
     /// Config identifier — used in the outer ECH extension.
     pub config_id: u8,

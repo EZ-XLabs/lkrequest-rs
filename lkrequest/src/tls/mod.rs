@@ -6,4 +6,4 @@
 mod connector;
 
 pub use connector::{keylog_to_file, TlsConnector, TlsStream, TlsTransport};
-pub use lktls::KeyLogCallback;
+pub use lktls::{ClientHelloCallback, KeyLogCallback};

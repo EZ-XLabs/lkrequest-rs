@@ -139,6 +139,16 @@ fn chrome_146_quic_profile() -> Option<QuicProfile> {
     None
 }
 
+#[cfg(feature = "quic-h3")]
+fn chrome_150_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_150_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_150_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
 /// Chrome 131 client preset.
 ///
 /// QUIC/H3 currently uses the shared generic Chromium profile.
@@ -258,6 +268,24 @@ pub fn chrome_149() -> ClientPreset {
     }
 }
 
+/// Chrome 150 client preset.
+///
+/// Captured from real Chrome 150.0.7871.47. The TCP and QUIC ClientHello use
+/// Chrome 150's ML-DSA signature algorithms. H2 is unchanged. QUIC/H3 uses the
+/// dedicated Chrome 150 transport profile captured from the Outlook flow.
+pub fn chrome_150() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_150(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_150_quic()),
+        h2_profile: crate::h2::profile::chrome_150_h2(),
+        quic_profile: chrome_150_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
 /// Firefox 133 client preset.
 ///
 /// A dedicated QUIC transport capture is not modelled yet, so this preset does
@@ -361,6 +389,29 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn chrome_150_preset_uses_dedicated_quic_profiles() {
+        let preset = chrome_150();
+        assert_eq!(preset.tls_profile.name, "Chrome 150");
+        assert_eq!(
+            preset
+                .quic_tls_profile
+                .as_ref()
+                .expect("chrome_150 preset should set QUIC TLS profile")
+                .name,
+            "Chrome 150 QUIC"
+        );
+        assert_eq!(
+            preset
+                .quic_profile
+                .as_ref()
+                .expect("chrome_150 preset should set QUIC profile"),
+            &lkh3::chrome_150_quic()
+        );
+        assert_ne!(preset.quic_profile, chrome_146().quic_profile);
+    }
+
     #[test]
     fn firefox_147_preset_leaves_quic_profile_unspecified() {
         let preset = firefox_147();
@@ -440,6 +491,7 @@ mod tests {
             chrome_147(),
             chrome_148(),
             chrome_149(),
+            chrome_150(),
             firefox_133(),
             firefox_147(),
             safari_18(),

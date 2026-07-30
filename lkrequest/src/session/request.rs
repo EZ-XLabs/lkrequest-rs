@@ -1043,21 +1043,40 @@ impl RequestBuilder {
                                     continue;
                                 }
                             }
-                            return Ok(resp);
+                            break Ok(resp);
                         }
                         Err(e) => {
                             attempt += 1;
                             if let Some(delay) = policy.should_retry(attempt, Some(&e), None) {
+                                // Only replay if doing so cannot duplicate a
+                                // server-side side effect (RFC 9110 §9.2.2):
+                                // safe/idempotent methods, or a failure that
+                                // proves the request was never processed. A
+                                // non-idempotent POST that failed *after*
+                                // transmission must surface the error rather
+                                // than be silently re-sent.
+                                if crate::retry::retry_is_replay_safe(
+                                    &ctx.method,
+                                    ctx.idempotency,
+                                    &e,
+                                ) {
+                                    tracing::warn!(
+                                        attempt = attempt,
+                                        error = %e,
+                                        delay_ms = delay.as_millis() as u64,
+                                        "http.retry_on_error",
+                                    );
+                                    tokio::time::sleep(delay).await;
+                                    continue;
+                                }
                                 tracing::warn!(
                                     attempt = attempt,
                                     error = %e,
-                                    delay_ms = delay.as_millis() as u64,
-                                    "http.retry_on_error",
+                                    method = %ctx.method,
+                                    "http.retry_skipped_non_idempotent",
                                 );
-                                tokio::time::sleep(delay).await;
-                                continue;
                             }
-                            return Err(e);
+                            break Err(e);
                         }
                     }
                 }

@@ -603,8 +603,10 @@ fn extract_supported_versions_token(ch: &ParsedClientHello) -> Option<String> {
 
     let versions = if ext.data.len() >= 3 && ext.data[0] as usize + 1 == ext.data.len() {
         ext.data[1..]
-            .chunks_exact(2)
-            .map(|chunk| u16::from_be_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| u16::from_be_bytes(*chunk))
             .collect::<Vec<_>>()
     } else if ext.data.len() == 2 {
         vec![u16::from_be_bytes([ext.data[0], ext.data[1]])]

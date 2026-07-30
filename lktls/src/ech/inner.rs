@@ -1,6 +1,6 @@
 //! Inner ClientHello construction and EncodedClientHelloInner encoding.
 //!
-//! Builds the `EncodedClientHelloInner` structure per draft-ietf-tls-esni-24
+//! Builds the `EncodedClientHelloInner` structure per RFC 9849
 //! Section 5.1, including:
 //!
 //! - Constructing ClientHelloInner with real SNI and `inner` ECH extension
@@ -13,7 +13,7 @@ pub const ECH_OUTER_EXTENSIONS_TYPE: u16 = 0xFD00;
 
 /// Compute the padding length for EncodedClientHelloInner.
 ///
-/// Follows draft-ietf-tls-esni-24 Section 6.1.3:
+/// Follows RFC 9849 Section 6.1.3:
 ///
 /// ```text
 /// padding_len = max(0, maximum_name_length - len(server_name))

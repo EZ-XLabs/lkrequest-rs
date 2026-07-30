@@ -11,6 +11,12 @@ use crate::error::{Error, Result};
 /// `chain[0] → chain[1] → … → self → target`, each hop CONNECT-tunneled over
 /// the previous hop's stream. Build chains with
 /// [`parse_chain`](ProxyConfig::parse_chain) or [`through`](ProxyConfig::through).
+///
+/// **TCP (H1/H2)** chains work with any mix of HTTP and SOCKS5 hops. **QUIC/H3**
+/// chains additionally work, but require *every* hop to be SOCKS5: the transport
+/// is carried over nested SOCKS5 UDP ASSOCIATE (one UDP relay per hop, stacked
+/// as nested per-datagram headers), which HTTP CONNECT cannot provide. A QUIC
+/// request over a chain containing an HTTP hop errors; fall back to H2.
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     /// The proxy protocol and address.

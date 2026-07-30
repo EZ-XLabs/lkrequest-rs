@@ -4,7 +4,7 @@
 //! an outer ClientHello (with a public-facing SNI), preventing network
 //! intermediaries from seeing which server the client is connecting to.
 //!
-//! This module implements the client-side of draft-ietf-tls-esni-24:
+//! This module implements the client-side of RFC 9849:
 //!
 //! - [`config`] — Parse ECHConfigList wire-format (from DNS HTTPS records) into structured data.
 //! - [`hpke`] — HPKE encryption wrapper for sealing the inner ClientHello.

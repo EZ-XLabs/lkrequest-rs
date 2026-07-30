@@ -25,7 +25,7 @@ use crate::record::reader::RecordReader;
 use crate::record::writer::RecordWriter;
 use crate::session_store::{SessionStore, TicketTlsVersion};
 use crate::verify::policy::VerificationPolicy;
-use crate::KeyLogCallback;
+use crate::{ClientHelloCallback, KeyLogCallback};
 
 // ---------------------------------------------------------------------------
 // Output types
@@ -58,6 +58,10 @@ pub struct HandshakeResult {
     pub negotiated_alpn: Option<String>,
     /// Negotiated cipher suite (if available).
     pub negotiated_cipher_suite: Option<u16>,
+    /// Negotiated TLS version (0x0303 = TLS 1.2, 0x0304 = TLS 1.3).
+    pub negotiated_version: Option<u16>,
+    /// Server certificate chain (DER, leaf first); empty on resumption.
+    pub peer_certificates: Vec<Vec<u8>>,
     /// Post-handshake state for processing KeyUpdate messages (TLS 1.3 only).
     pub post_handshake: Option<PostHandshakeState>,
     /// Session ticket context for processing NewSessionTicket messages.
@@ -250,6 +254,9 @@ pub struct HandshakeConfig {
     pub ech_config_list: Option<Vec<u8>>,
     pub custom_ca_anchors: Option<Arc<Vec<rustls_pki_types::TrustAnchor<'static>>>>,
     pub keylog_callback: Option<KeyLogCallback>,
+    /// Observes the raw ClientHello bytes about to be sent (see
+    /// [`ClientHelloCallback`]). Does not affect the handshake.
+    pub client_hello_callback: Option<ClientHelloCallback>,
 }
 
 /// QUIC handshake configuration wrapper.
@@ -320,10 +327,25 @@ pub struct HandshakeDriver {
     state: DriverState,
     reader: RecordReader,
     writer: RecordWriter,
+    /// Reassembly buffer for the TLS 1.3 encrypted handshake flight.
+    ///
+    /// A handshake message MAY be fragmented across several records (RFC 8446
+    /// §5.1: "Handshake messages MAY be … fragmented across several records"),
+    /// and server Certificate flights routinely are. Decrypted handshake bytes
+    /// are appended here and only *complete* messages are handed to the state
+    /// machine, with any partial trailer carried to the next record — the same
+    /// buffering the QUIC CRYPTO path already does, and what BoringSSL does with
+    /// its handshake buffer (`ssl3_read_handshake_bytes`).
+    hs_buffer: Vec<u8>,
     /// Original session ticket taken from the store during `start()`.
     /// Preserved so that if the server negotiates TLS 1.2 instead of 1.3,
     /// the ticket can be used for TLS 1.2 session resumption.
     original_ticket: Option<crate::session_store::SessionTicketData>,
+    /// Fatal alert record generated for a local protocol error.
+    ///
+    /// The Sans-I/O API returns the original error to the caller, so the alert
+    /// is retained separately for the transport adapter to send best-effort.
+    pending_alert: Option<Vec<u8>>,
 }
 
 impl HandshakeDriver {
@@ -333,7 +355,9 @@ impl HandshakeDriver {
             state: DriverState::Start,
             reader: RecordReader::new(),
             writer: RecordWriter::new(),
+            hs_buffer: Vec::new(),
             original_ticket: None,
+            pending_alert: None,
         }
     }
 
@@ -419,6 +443,12 @@ impl HandshakeDriver {
         }
 
         let ch_msg = hs.build_client_hello()?;
+        // Observe the exact ClientHello handshake message (0x01-prefixed, before
+        // TLS-record framing) the moment it is produced. Honoured here so the hook
+        // works for direct lktls users too, not just lkrequest's connector.
+        if let Some(ref cb) = self.config.client_hello_callback {
+            cb(&ch_msg);
+        }
         let ch_record = self.writer.write_record(content_type::HANDSHAKE, &ch_msg)?;
         tracing::debug!("tls.client_hello_sent");
 
@@ -436,6 +466,33 @@ impl HandshakeDriver {
 
     /// Drive the handshake forward. Call in a loop after each `feed()`.
     pub fn progress(&mut self) -> Result<HandshakeOutput> {
+        match self.progress_inner() {
+            Ok(output) => Ok(output),
+            Err(error) => {
+                if let TlsError::LocalAlert { alert, .. } = &error {
+                    match self.writer.write_record(
+                        content_type::ALERT,
+                        &[alert.level.as_byte(), alert.description.as_byte()],
+                    ) {
+                        Ok(record) => self.pending_alert = Some(record),
+                        Err(record_error) => tracing::warn!(
+                            error = %record_error,
+                            "tls.local_alert_record_failed"
+                        ),
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Take a locally generated fatal alert record after [`Self::progress`]
+    /// returns [`TlsError::LocalAlert`].
+    pub fn take_pending_alert(&mut self) -> Option<Vec<u8>> {
+        self.pending_alert.take()
+    }
+
+    fn progress_inner(&mut self) -> Result<HandshakeOutput> {
         // TLS 1.2 WaitServerFinished has special record-level handling
         if matches!(self.state, DriverState::Tls12WaitServerFinished { .. }) {
             return self.progress_tls12_wait_finished();
@@ -494,7 +551,20 @@ impl HandshakeDriver {
                     }
                 }
                 DriverState::Tls13Encrypted { mut handshake } => {
-                    match handshake.process_handshake_record(&record.payload)? {
+                    // A handshake message may span several records (RFC 8446
+                    // §5.1); large Certificate flights (e.g. Facebook) routinely
+                    // do. Accumulate decrypted handshake bytes and process only
+                    // complete messages, carrying any partial trailer to the
+                    // next record. Multiple coalesced messages in one record are
+                    // handled the same way.
+                    self.hs_buffer.extend_from_slice(&record.payload);
+                    let Some(messages) = take_complete_handshake_messages(&mut self.hs_buffer)?
+                    else {
+                        // No complete message yet — wait for the next record.
+                        self.state = DriverState::Tls13Encrypted { handshake };
+                        continue;
+                    };
+                    match handshake.process_handshake_record(&messages)? {
                         HandshakeAction::ContinueReading => {
                             self.state = DriverState::Tls13Encrypted { handshake };
                             continue;
@@ -511,7 +581,20 @@ impl HandshakeDriver {
                     mut handshake,
                     client_random,
                 } => {
-                    let action = handshake.process_handshake_record(&record.payload)?;
+                    // TLS 1.2 handshake messages (esp. a large Certificate) can
+                    // also span several records (RFC 8446 §5.1 applies to 1.2's
+                    // record layer too) — buffer and process only complete
+                    // messages, mirroring the TLS 1.3 path above.
+                    self.hs_buffer.extend_from_slice(&record.payload);
+                    let Some(messages) = take_complete_handshake_messages(&mut self.hs_buffer)?
+                    else {
+                        self.state = DriverState::Tls12ServerFlight {
+                            handshake,
+                            client_random,
+                        };
+                        continue;
+                    };
+                    let action = handshake.process_handshake_record(&messages)?;
                     match action {
                         Tls12HandshakeAction::ContinueReading => {
                             self.state = DriverState::Tls12ServerFlight {
@@ -552,13 +635,15 @@ impl HandshakeDriver {
         mut handshake: Tls13Handshake,
         server_hello: &[u8],
     ) -> Result<HandshakeOutput> {
-        let ccs = self
-            .writer
-            .write_record(content_type::CHANGE_CIPHER_SPEC, &[0x01])?;
-
         let action = handshake.process_handshake_record(server_hello)?;
         match action {
             HandshakeAction::InstallHandshakeKeys(keys) => {
+                let ccs = if handshake.has_received_hrr() {
+                    Vec::new()
+                } else {
+                    self.writer
+                        .write_record(content_type::CHANGE_CIPHER_SPEC, &[0x01])?
+                };
                 self.reader.set_keys(Aead::new(
                     keys.aead_algorithm,
                     &keys.server_key,
@@ -573,6 +658,9 @@ impl HandshakeDriver {
                 Ok(HandshakeOutput::SendData(ccs))
             }
             HandshakeAction::RetryClientHello(ch2) => {
+                let ccs = self
+                    .writer
+                    .write_record(content_type::CHANGE_CIPHER_SPEC, &[0x01])?;
                 let mut rw = RecordWriter::new();
                 rw.mark_post_initial();
                 let ch2_record = rw.write_record(content_type::HANDSHAKE, &ch2)?;
@@ -651,6 +739,8 @@ impl HandshakeDriver {
                 writer: std::mem::take(&mut self.writer),
                 negotiated_alpn: complete.negotiated_alpn,
                 negotiated_cipher_suite: Some(complete.negotiated_cipher_suite),
+                negotiated_version: Some(0x0304),
+                peer_certificates: complete.server_certificates,
                 post_handshake: Some(PostHandshakeState {
                     server_app_secret: ts.server_app_secret.clone(),
                     client_app_secret: ts.client_app_secret.clone(),
@@ -699,7 +789,16 @@ impl HandshakeDriver {
         }
 
         tls12.feed_client_hello(&ch_msg);
-        let action = tls12.process_handshake_record(server_hello)?;
+        // The first server record may coalesce ServerHello with (part of) the
+        // Certificate flight, and a handshake message may be fragmented across
+        // records (RFC 8446 §5.1). Process the complete messages here and carry
+        // any partial trailer into `hs_buffer` for the Tls12ServerFlight state.
+        let mut initial = server_hello.to_vec();
+        let action = match take_complete_handshake_messages(&mut initial)? {
+            Some(msgs) => tls12.process_handshake_record(&msgs)?,
+            None => Tls12HandshakeAction::ContinueReading,
+        };
+        self.hs_buffer = initial;
         match action {
             Tls12HandshakeAction::ContinueReading => {
                 self.state = DriverState::Tls12ServerFlight {
@@ -804,6 +903,8 @@ impl HandshakeDriver {
                 writer: std::mem::take(&mut self.writer),
                 negotiated_alpn: alpn,
                 negotiated_cipher_suite: Some(abbr_flight.traffic_keys.cipher_suite.code_point()),
+                negotiated_version: Some(0x0303),
+                peer_certificates: handshake.server_certificates().to_vec(),
                 post_handshake: None,
                 session_ticket_ctx: None,
             }),
@@ -933,6 +1034,8 @@ impl HandshakeDriver {
                             writer: std::mem::take(&mut self.writer),
                             negotiated_alpn: alpn,
                             negotiated_cipher_suite: Some(traffic_keys.cipher_suite.code_point()),
+                            negotiated_version: Some(0x0303),
+                            peer_certificates: handshake.server_certificates().to_vec(),
                             post_handshake: None,
                             session_ticket_ctx: None,
                         }),
@@ -1048,6 +1151,12 @@ impl QuicHandshakeDriver {
         }
 
         let ch = hs.build_client_hello()?;
+        // Same ClientHello observation hook as the TCP driver. QUIC has no TLS
+        // record layer, so this is the bare handshake message (CRYPTO-frame
+        // payload) — matching what the TCP driver emits to the callback.
+        if let Some(ref cb) = self.config.tls.client_hello_callback {
+            cb(&ch);
+        }
         self.state = QuicDriverState::WaitServerHello { handshake: hs };
         Ok(ch)
     }
@@ -1270,6 +1379,167 @@ mod tests {
     use std::sync::Arc;
     use std::time::Instant;
 
+    // -----------------------------------------------------------------------
+    // Handshake-message reassembly across records (RFC 8446 §5.1)
+    //
+    // A handshake message MAY be fragmented across several TLS records, and
+    // several messages MAY be coalesced into one. The TLS 1.2 and 1.3 driver
+    // paths both feed decrypted record payloads through
+    // `take_complete_handshake_messages`, which drains only *complete* messages
+    // and retains any partial trailer for the next record. These tests lock in
+    // that behaviour — the exact scenario that made Facebook (a fragmented
+    // Certificate flight) fail with "truncated handshake message in record".
+    // -----------------------------------------------------------------------
+
+    /// Build a handshake message: 1-byte type + 3-byte length + `len` body bytes.
+    fn hs_msg(msg_type: u8, fill: u8, len: usize) -> Vec<u8> {
+        let mut m = Vec::with_capacity(4 + len);
+        m.push(msg_type);
+        m.push((len >> 16) as u8);
+        m.push((len >> 8) as u8);
+        m.push(len as u8);
+        m.resize(4 + len, fill);
+        m
+    }
+
+    fn hrr_message(session_id: &[u8], cipher_suite: u16, extensions: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(&0x0303u16.to_be_bytes());
+        body.extend_from_slice(&crate::handshake::server_hello::HRR_RANDOM);
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&cipher_suite.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(extensions);
+
+        let mut message = vec![crate::handshake::handshake_type::SERVER_HELLO];
+        let body_len = body.len();
+        message.extend_from_slice(&[
+            (body_len >> 16) as u8,
+            (body_len >> 8) as u8,
+            body_len as u8,
+        ]);
+        message.extend_from_slice(&body);
+        message
+    }
+
+    #[test]
+    fn local_hrr_error_queues_plaintext_fatal_alert() {
+        let profile = crate::profile::presets::chrome_150();
+        let cipher_suite = profile.cipher_suites[0];
+        let already_offered = profile.key_share_curves[0];
+        let mut config = make_config_with_store(Arc::new(InMemorySessionStore::new()));
+        config.profile = profile;
+        config.hostname = "example.com".to_string();
+        config.verification_policy = VerificationPolicy::Insecure;
+        let mut driver = HandshakeDriver::new(config);
+
+        let client_hello_record = driver.start().unwrap();
+        let client_hello = &client_hello_record[5..];
+        let session_id_len = client_hello[38] as usize;
+        let session_id = &client_hello[39..39 + session_id_len];
+
+        let mut extensions = vec![0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+        extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x02]);
+        extensions.extend_from_slice(&already_offered.to_be_bytes());
+        let hrr = hrr_message(session_id, cipher_suite, &extensions);
+        let mut record = vec![content_type::HANDSHAKE, 0x03, 0x03];
+        record.extend_from_slice(&(hrr.len() as u16).to_be_bytes());
+        record.extend_from_slice(&hrr);
+        driver.feed(&record);
+
+        let error = match driver.progress() {
+            Err(error) => error,
+            Ok(_) => panic!("invalid HRR must fail"),
+        };
+        assert!(matches!(
+            error,
+            TlsError::LocalAlert {
+                alert: crate::error::TlsAlert {
+                    description: crate::error::AlertDescription::IllegalParameter,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            driver.take_pending_alert().as_deref(),
+            Some(&[content_type::ALERT, 0x03, 0x03, 0x00, 0x02, 0x02, 0x2f][..])
+        );
+        assert!(driver.take_pending_alert().is_none());
+    }
+
+    #[test]
+    fn reassembly_single_complete_message() {
+        let msg = hs_msg(0x0b, 0xAA, 10);
+        let mut buf = msg.clone();
+        let out = take_complete_handshake_messages(&mut buf).unwrap();
+        assert_eq!(out.as_deref(), Some(msg.as_slice()));
+        assert!(buf.is_empty(), "buffer fully drained");
+    }
+
+    #[test]
+    fn reassembly_coalesced_messages_drain_together() {
+        let a = hs_msg(0x08, 0x01, 3);
+        let b = hs_msg(0x0b, 0x02, 5);
+        let mut buf = [a.clone(), b.clone()].concat();
+        let out = take_complete_handshake_messages(&mut buf).unwrap().unwrap();
+        assert_eq!(out, [a, b].concat());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn reassembly_message_fragmented_across_records() {
+        // The core regression: one message split across two records. The first
+        // record carries only part of it → nothing surfaced yet; the remainder
+        // in the next record completes it. (Previously errored "truncated".)
+        let msg = hs_msg(0x0b, 0xCD, 20);
+        let (head, tail) = msg.split_at(11);
+
+        let mut buf = head.to_vec();
+        assert!(
+            take_complete_handshake_messages(&mut buf)
+                .unwrap()
+                .is_none(),
+            "a partial message must not be surfaced"
+        );
+        assert_eq!(buf, head, "partial bytes retained for the next record");
+
+        buf.extend_from_slice(tail);
+        let out = take_complete_handshake_messages(&mut buf).unwrap().unwrap();
+        assert_eq!(out, msg, "reassembled the full message");
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn reassembly_partial_trailer_retained() {
+        // A record with a complete message followed by the start of another:
+        // the complete one drains, the partial trailer stays for next time.
+        let done = hs_msg(0x0e, 0x00, 0); // ServerHelloDone (empty body)
+        let next = hs_msg(0x0b, 0xEE, 30);
+        let mut buf = [done.clone(), next[..6].to_vec()].concat();
+
+        let out = take_complete_handshake_messages(&mut buf).unwrap().unwrap();
+        assert_eq!(out, done, "only the complete message drains");
+        assert_eq!(buf, next[..6], "partial trailer retained");
+
+        buf.extend_from_slice(&next[6..]);
+        let out2 = take_complete_handshake_messages(&mut buf).unwrap().unwrap();
+        assert_eq!(out2, next);
+    }
+
+    #[test]
+    fn reassembly_oversized_length_is_incomplete_not_panic() {
+        // A header claiming a huge body with no data behind it is treated as
+        // incomplete (wait for more), never a panic or a bogus drain.
+        let mut buf = vec![0x0b, 0xff, 0xff, 0xff];
+        assert!(take_complete_handshake_messages(&mut buf)
+            .unwrap()
+            .is_none());
+        assert_eq!(buf, vec![0x0b, 0xff, 0xff, 0xff], "left intact");
+    }
+
     fn make_tls13_ticket() -> SessionTicketData {
         SessionTicketData {
             ticket: vec![0x01, 0x02, 0x03],
@@ -1327,6 +1597,7 @@ mod tests {
             ech_config_list: None,
             custom_ca_anchors: None,
             keylog_callback: None,
+            client_hello_callback: None,
         }
     }
 
@@ -1398,6 +1669,43 @@ mod tests {
 
         assert_eq!(st_len, 0, "session_ticket must be empty for TLS 1.3 PSK");
         assert!(has_psk, "pre_shared_key must be present for TLS 1.3 ticket");
+    }
+
+    #[test]
+    fn client_hello_callback_fires_from_driver_with_handshake_message() {
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+
+        let mut config = make_config_with_store(Arc::new(InMemorySessionStore::new()));
+        config.client_hello_callback = Some(Arc::new(move |bytes: &[u8]| {
+            sink.lock().unwrap().extend_from_slice(bytes);
+        }));
+
+        let mut driver = HandshakeDriver::new(config);
+        let ch_record = driver.start().unwrap();
+
+        let observed = captured.lock().unwrap().clone();
+        // The driver itself fires the hook (it was previously dead at the lktls
+        // layer — only lkrequest's connector invoked it).
+        assert!(
+            !observed.is_empty(),
+            "client_hello_callback must fire from the driver"
+        );
+        // It receives the ClientHello *handshake message* (0x01), not the
+        // record-framed wire bytes (0x16) that `start()` returns.
+        assert_eq!(
+            observed[0], 0x01,
+            "callback must get the handshake message (0x01), not the record"
+        );
+        assert_eq!(ch_record[0], 0x16, "start() returns the TLS record (0x16)");
+        // No data loss: the observed handshake message is exactly the record
+        // payload (the TLS record header is 5 bytes).
+        assert_eq!(
+            &observed[..],
+            &ch_record[5..],
+            "callback bytes must equal the record payload"
+        );
     }
 
     #[test]
@@ -1556,6 +1864,46 @@ mod tests {
             .map(|(_, data)| data);
 
         assert_eq!(alps, Some(vec![0x00, 0x03, 0x02, b'h', b'3']));
+    }
+
+    /// ALPS advertisement in the ClientHello is DECOUPLED from the client's
+    /// settings payload. The ClientHello ALPS extension always carries the
+    /// profile's protocol list (`h2`); the settings payload rides separately in
+    /// the Client EncryptedExtensions. Real Chrome advertises ALPS `h2` with an
+    /// EMPTY settings payload, so `Some(vec![])` MUST still advertise ALPS.
+    ///   None    => no ALPS (H1-only request path)
+    ///   Some(_) => advertise ALPS `h2` (payload content is irrelevant *here*)
+    #[test]
+    fn alps_advertisement_is_decoupled_from_settings_payload() {
+        // chrome_144: alps_protocols = Some(["h2"]) and lists 0x44cd.
+        let ch_alps = |payload: Option<Vec<u8>>| -> Option<Vec<u8>> {
+            let mut config = make_config_with_store(Arc::new(InMemorySessionStore::new()));
+            config.alps_payload = payload;
+            let mut driver = HandshakeDriver::new(config);
+            let ch = driver.start().unwrap();
+            // TCP .start() returns a TLS record; skip the 5-byte record header to
+            // get the handshake message that parse_raw_client_hello_extensions wants.
+            parse_raw_client_hello_extensions(&ch[5..])
+                .into_iter()
+                .find(|(t, _)| *t == 0x44cd)
+                .map(|(_, d)| d)
+        };
+        // The ClientHello ALPS extension body is always the h2 protocol list,
+        // never the settings payload.
+        let h2_protocol_list = vec![0x00, 0x03, 0x02, b'h', b'2'];
+
+        assert_eq!(ch_alps(None), None, "None ⇒ no ALPS (H1-only)");
+        assert_eq!(
+            ch_alps(Some(vec![])),
+            Some(h2_protocol_list.clone()),
+            "Some(empty) ⇒ ALPS advertises h2 (Chrome: advertise + empty settings)"
+        );
+        assert_eq!(
+            ch_alps(Some(vec![0x00, 0x01, 0x00, 0x00, 0x00, 0x64])),
+            Some(h2_protocol_list),
+            "Some(non-empty settings) ⇒ ClientHello ALPS still shows the h2 \
+             protocol list, not the settings payload (payload rides in Client EE)"
+        );
     }
 
     #[test]

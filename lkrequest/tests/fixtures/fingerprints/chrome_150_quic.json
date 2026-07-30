@@ -1,0 +1,129 @@
+{
+  "connection_id_length": 0,
+  "extra_transport_parameters": [
+    [
+      17,
+      "000000019a9aca7a00000001"
+    ],
+    [
+      1706645775112002058,
+      "00"
+    ],
+    [
+      12584,
+      "4f524947"
+    ],
+    [
+      12583,
+      "8009df94"
+    ]
+  ],
+  "grease_settings": true,
+  "grease_transport_params": false,
+  "h3_settings": [
+    [
+      1,
+      65536
+    ],
+    [
+      6,
+      262144
+    ],
+    [
+      7,
+      100
+    ],
+    [
+      51,
+      1
+    ]
+  ],
+  "h3_settings_fingerprint": "1:65536;6:262144;7:100;51:1",
+  "h3_settings_hash": "766911b264ace59f10e4028b429669df274476b6f23b6653bb292e003b86617c",
+  "initial_destination_connection_id_length": 8,
+  "packetization": {
+    "disable_mtu_discovery": false,
+    "enable_ecn": false,
+    "enable_segmentation_offload": false,
+    "initial_datagram_size": 1250,
+    "initial_mtu": 1250
+  },
+  "packetization_fingerprint": "initial_mtu:1250;initial_datagram_size:1250;disable_mtu_discovery:false;enable_segmentation_offload:false;enable_ecn:false;initial_frame_layout:none",
+  "packetization_hash": "a0b240a0706d7bf3aacde68d2cdd84d5f492505a88bdfa63039f28befff0fd83",
+  "priority_updates": [
+    [
+      0,
+      "u=0, i"
+    ]
+  ],
+  "pseudo_header_order": [
+    ":method",
+    ":authority",
+    ":scheme",
+    ":path"
+  ],
+  "pseudo_header_order_token": "masp",
+  "send_control_grease_frame": true,
+  "send_min_ack_delay": false,
+  "send_reserved_transport_parameter": false,
+  "transport_fingerprint": "max_idle_timeout:30000;initial_max_data:15728640;initial_max_stream_data_bidi_local:6291456;initial_max_stream_data_bidi_remote:6291456;initial_max_stream_data_uni:6291456;initial_max_streams_bidi:100;initial_max_streams_uni:103;active_connection_id_limit:2;max_udp_payload_size:1472;max_datagram_frame_size:65536;send_min_ack_delay:false;send_reserved_transport_parameter:false;extra:0x11:000000019a9aca7a00000001;extra:0x17af394a4ef8da0a:00;extra:0x3128:4f524947;extra:0x3127:8009df94;order:0x5;order:0xf;order:0x4;order:0x20;order:0x6;order:0x9;order:0x3128;order:0x17af394a4ef8da0a;order:0x3127;order:0x1;order:0x3;order:0x7;order:0x8;order:0x11",
+  "transport_hash": "664c3bb8173726c65c7e09c2ca471979297010825202df505a0224868adc5874",
+  "transport_parameter_order": [
+    5,
+    15,
+    4,
+    32,
+    6,
+    9,
+    12584,
+    1706645775112002058,
+    12583,
+    1,
+    3,
+    7,
+    8,
+    17
+  ],
+  "transport_parameters": [
+    [
+      "max_idle_timeout",
+      30000
+    ],
+    [
+      "initial_max_data",
+      15728640
+    ],
+    [
+      "initial_max_stream_data_bidi_local",
+      6291456
+    ],
+    [
+      "initial_max_stream_data_bidi_remote",
+      6291456
+    ],
+    [
+      "initial_max_stream_data_uni",
+      6291456
+    ],
+    [
+      "initial_max_streams_bidi",
+      100
+    ],
+    [
+      "initial_max_streams_uni",
+      103
+    ],
+    [
+      "active_connection_id_limit",
+      2
+    ],
+    [
+      "max_udp_payload_size",
+      1472
+    ],
+    [
+      "max_datagram_frame_size",
+      65536
+    ]
+  ]
+}

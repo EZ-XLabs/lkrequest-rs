@@ -24,7 +24,9 @@ use crate::error::{Error, Result};
 use crate::protocol::FallbackPolicy;
 #[cfg(feature = "quic-h3")]
 use crate::protocol::RacePolicy;
-use crate::protocol::{AcquisitionPolicy, HttpIntent, ProtocolPolicy, RouteKey, UpgradePolicy};
+use crate::protocol::{
+    AcquisitionPolicy, DnsResolutionMode, HttpIntent, ProtocolPolicy, RouteKey, UpgradePolicy,
+};
 use crate::proxy::ProxyConfig;
 
 #[cfg(feature = "quic-h3")]
@@ -414,10 +416,16 @@ pub(crate) fn build_connect_config(
         tls_profile.alpn_protocols = alpn_for_h1_only(&tls_profile.alpn_protocols);
     }
 
+    // ALPS: real Chrome advertises `application_settings: h2` in the ClientHello
+    // but sends an EMPTY client-settings payload in its Client EncryptedExtensions
+    // (verified from a real Chrome capture). Advertise iff the profile declares
+    // ALPS support; never for the H1-only path. `Some(empty)` = advertise + empty.
     let alps_payload = if http_version_pref == PreferredHttpVersion::Http1Only {
-        Vec::new()
+        None
+    } else if tls_profile.alps_protocols.is_some() {
+        Some(Vec::new())
     } else {
-        crate::h2::profile::encode_alps_h2_settings(client.h2_profile())
+        None
     };
 
     let config = crate::connect::ConnectConfig::https(tls_profile, alps_payload);
@@ -435,7 +443,7 @@ pub(crate) fn build_h1_only_connect_config(
 ) -> crate::connect::ConnectConfig {
     let mut h1_profile = client.tls_profile().clone();
     h1_profile.alpn_protocols = alpn_for_h1_only(&h1_profile.alpn_protocols);
-    let config = crate::connect::ConnectConfig::https(h1_profile, Vec::new());
+    let config = crate::connect::ConnectConfig::https(h1_profile, None);
     if scheme == Scheme::Http {
         config.into_http()
     } else {
@@ -986,13 +994,21 @@ pub(crate) async fn discover_quic_support(
         &origin,
     );
     let alt_svc = learned_state.alt_svc.clone();
-    let dns_https = session
-        .client()
-        .resolver()
-        .lookup_https(host)
-        .await
-        .ok()
-        .flatten();
+    // DNS-based H3 discovery only on routes where we resolve locally. On
+    // remote-DNS routes (socks5h / HTTP CONNECT) the proxy resolves the target,
+    // so a local HTTPS-RR (SVCB) query here would leak the target hostname
+    // out-of-band from the proxy — skip it.
+    let dns_https = if route.dns_mode == DnsResolutionMode::Local {
+        session
+            .client()
+            .resolver()
+            .lookup_https(host)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
 
     let (source, advertised_host, advertised_port) = if let Some(entry) = alt_svc {
         (
@@ -1214,6 +1230,122 @@ mod tests {
         async fn lookup_https(&self, _host: &str) -> io::Result<Option<HttpsRecord>> {
             Ok(self.https.clone())
         }
+    }
+
+    /// Resolver that records every host passed to `resolve` / `lookup_https`, so
+    /// tests can assert that remote-DNS routes perform **no** local DNS for the
+    /// target (DNS-leak regression guard — see the gate in `discover_quic_support`
+    /// and `Session::build_tls_connector`).
+    #[derive(Clone, Default)]
+    struct RecordingDns {
+        resolve_calls: Arc<std::sync::Mutex<Vec<String>>>,
+        https_calls: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl crate::dns::DnsResolver for RecordingDns {
+        async fn resolve(&self, host: &str, port: u16) -> io::Result<Vec<std::net::SocketAddr>> {
+            self.resolve_calls.lock().unwrap().push(host.to_string());
+            Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], port))])
+        }
+
+        async fn lookup_https(&self, host: &str) -> io::Result<Option<HttpsRecord>> {
+            self.https_calls.lock().unwrap().push(host.to_string());
+            Ok(None)
+        }
+    }
+
+    /// A local HTTPS-RR (SVCB) query for the target is a DNS leak on remote-DNS
+    /// routes (socks5h / HTTP CONNECT): the proxy resolves the target, so any
+    /// local lookup reveals the target hostname out-of-band from the proxy. The
+    /// H3-discovery path must skip it there, but still run it on direct routes.
+    #[cfg(feature = "quic-h3")]
+    #[tokio::test]
+    async fn discover_quic_support_does_not_leak_dns_https_on_remote_dns_routes() {
+        let rec = RecordingDns::default();
+        let session = test_client_builder()
+            .dns_resolver(Arc::new(rec.clone()))
+            .quic_profile(lkh3::chrome_quic())
+            .build()
+            .session()
+            .build();
+
+        let socks5h = ProxyConfig::parse("socks5h://proxy.example.com:1080").unwrap();
+        let _ = discover_quic_support(
+            &session,
+            Scheme::Https,
+            "example.com",
+            443,
+            Some(&socks5h),
+            &test_policy(),
+            PreferredHttpVersion::Auto,
+        )
+        .await;
+        let http = ProxyConfig::parse("http://proxy.example.com:8080").unwrap();
+        let _ = discover_quic_support(
+            &session,
+            Scheme::Https,
+            "example.com",
+            443,
+            Some(&http),
+            &test_policy(),
+            PreferredHttpVersion::Auto,
+        )
+        .await;
+        assert!(
+            rec.https_calls.lock().unwrap().is_empty(),
+            "remote-DNS routes must not perform a local DNS HTTPS-RR lookup (DNS leak); got {:?}",
+            rec.https_calls.lock().unwrap()
+        );
+
+        // Direct route resolves locally → DNS-based H3 discovery is expected.
+        let _ = discover_quic_support(
+            &session,
+            Scheme::Https,
+            "example.com",
+            443,
+            None,
+            &test_policy(),
+            PreferredHttpVersion::Auto,
+        )
+        .await;
+        assert_eq!(
+            rec.https_calls.lock().unwrap().as_slice(),
+            ["example.com"],
+            "direct route should attempt DNS HTTPS-RR discovery exactly once",
+        );
+    }
+
+    /// DNS-based ECH discovery (an HTTPS-RR lookup) must be skipped on remote-DNS
+    /// routes (`is_remote_dns = true`), where a local lookup would leak the target
+    /// hostname out-of-band from the proxy; it must still run on local routes.
+    #[tokio::test]
+    async fn build_tls_connector_does_not_leak_dns_ech_on_remote_dns_routes() {
+        let rec = RecordingDns::default();
+        let session = test_client_builder()
+            .dns_resolver(Arc::new(rec.clone()))
+            .build()
+            .session()
+            .build();
+        let profile = lktls::profile::presets::chrome_144();
+
+        let _ = session
+            .build_tls_connector(profile.clone(), None, "example.com", true)
+            .await;
+        assert!(
+            rec.https_calls.lock().unwrap().is_empty(),
+            "remote-DNS mode must not leak the target via a local DNS ECH lookup; got {:?}",
+            rec.https_calls.lock().unwrap()
+        );
+
+        let _ = session
+            .build_tls_connector(profile, None, "example.com", false)
+            .await;
+        assert_eq!(
+            rec.https_calls.lock().unwrap().as_slice(),
+            ["example.com"],
+            "local-DNS mode should attempt DNS-based ECH discovery exactly once",
+        );
     }
 
     #[cfg(feature = "quic-h3")]

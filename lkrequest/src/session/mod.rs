@@ -167,15 +167,22 @@ fn randomize_quic_grease_params(
                 value[4..8].copy_from_slice(&g);
             }
         } else if id_v >= 27 && (id_v - 27) % 31 == 0 {
-            // Reserved GREASE TP → fresh random reserved id + random-length value.
+            // Reserved GREASE TP → fresh random reserved id and value. A
+            // non-empty profile placeholder locks the captured wire length;
+            // an empty placeholder retains the legacy randomized 1..=16 range.
             // `grease_reserved_tp_id` guarantees an 8-byte-varint, non-locally-
             // encoded id, so the encode below cannot be rejected.
             let mut n = [0u8; 4];
             fill(&mut n);
             let new_id = grease_reserved_tp_id(u32::from_le_bytes(n));
-            let mut lb = [0u8; 1];
-            fill(&mut lb);
-            let mut val = vec![0u8; 1 + (lb[0] as usize % 16)];
+            let value_len = if value.is_empty() {
+                let mut lb = [0u8; 1];
+                fill(&mut lb);
+                1 + (lb[0] as usize % 16)
+            } else {
+                value.len()
+            };
+            let mut val = vec![0u8; value_len];
             fill(&mut val);
             for slot in order.iter_mut() {
                 if *slot == *id {
@@ -227,7 +234,9 @@ fn decode_hex(value: &str) -> crate::error::Result<Vec<u8>> {
 
     value
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|chunk| {
             let hi = hex_nibble(chunk[0])?;
             let lo = hex_nibble(chunk[1])?;
@@ -285,16 +294,19 @@ impl RedirectPolicy {
 // Idempotency (per-request 0-RTT opt-in, Chrome model)
 // ---------------------------------------------------------------------------
 
-/// Whether a request may be sent in QUIC 0-RTT / TLS early data.
+/// Whether a request is **safe to replay** — governing both QUIC 0-RTT / TLS
+/// early data and automatic retries after a transport failure.
 ///
 /// Mirrors the tri-state `HttpRequestInfo::idempotency` flag in Chromium
-/// (`net/base/idempotency.h`) so that QUIC 0-RTT follows the same replay
-/// safety rules as Chrome.
+/// (`net/base/idempotency.h`) so that replay decisions follow the same rules
+/// as Chrome.
 ///
 /// ## Semantics
 ///
-/// | Value | 0-RTT allowed? |
-/// |-------|----------------|
+/// The same predicate ([`can_send_early_data`]) decides two things:
+///
+/// | Value | Safe to replay (0-RTT *and* auto-retry)? |
+/// |-------|------------------------------------------|
 /// | [`Idempotency::Default`] | only for RFC 9110 §9.2.1 *safe* methods: `GET`, `HEAD`, `OPTIONS`, `TRACE` |
 /// | [`Idempotency::Idempotent`] | yes — caller asserts the request is safe to replay (e.g. POST with an Idempotency-Key header) |
 /// | [`Idempotency::NotIdempotent`] | no — caller explicitly opts out even for safe methods |
@@ -306,12 +318,19 @@ impl RedirectPolicy {
 /// methods) fall through the [`Idempotency::Default`] arm as "not safe",
 /// matching the "MUST NOT" clause.
 ///
-/// ## Current state
+/// ## Where it applies
 ///
-/// lkrequest attempts QUIC 0-RTT only when a resumable H3 session exists and
-/// [`can_send_early_data`] says the request is replay-safe. If the server
-/// rejects early data, the client drops the speculative H3 request and replays
-/// it after the normal handshake.
+/// - **QUIC 0-RTT** — lkrequest attempts early data only when a resumable H3
+///   session exists and this predicate says the request is replay-safe. If the
+///   server rejects early data, the speculative H3 request is dropped and
+///   replayed after the normal handshake.
+/// - **Automatic retries** — a configured [`RetryPolicy`](crate::retry::RetryPolicy)
+///   re-sends the (buffered) request body. For non-idempotent methods, a retry
+///   only happens when the failure *proves* the request was never processed
+///   (see [`Error::is_safe_to_replay`](crate::error::Error::is_safe_to_replay))
+///   *or* this is set to [`Idempotency::Idempotent`]. A timeout/reset after a
+///   `POST` was transmitted is **not** silently retried. See
+///   [`crate::retry::retry_is_replay_safe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Idempotency {
     /// Decide automatically based on the HTTP method (RFC 9110 safe methods).
@@ -471,6 +490,14 @@ pub(crate) struct SessionInner {
 
     /// Redirect policy for this session.
     pub redirect_policy: RedirectPolicy,
+
+    /// When `true`, refuse to follow a redirect to a non-HTTPS URL. Default
+    /// `false` (Chrome-faithful: scheme downgrades are followed).
+    pub https_only: bool,
+
+    /// HSTS / scheme-upgrade policy: decides whether an `http://` URL is
+    /// upgraded to `https://` before connecting. Default [`NoHsts`](crate::hsts::NoHsts).
+    pub hsts_policy: Arc<dyn crate::hsts::HstsPolicy>,
 
     /// TLS session ticket store for session resumption (shared across connections).
     pub session_store: Arc<InMemorySessionStore>,
@@ -1035,14 +1062,20 @@ impl Session {
     pub(crate) async fn build_tls_connector(
         &self,
         tls_profile: lktls::profile::types::TlsProfile,
-        alps_payload: Vec<u8>,
+        alps_payload: Option<Vec<u8>>,
         host: &str,
+        is_remote_dns: bool,
     ) -> crate::tls::TlsConnector {
         let client = &self.inner.client;
         let mut connector = crate::tls::TlsConnector::new(tls_profile)
-            .alps_payload(alps_payload)
             .session_store(self.inner.session_store.clone()
                 as std::sync::Arc<dyn lktls::session_store::SessionStore>);
+        // `None` => don't advertise ALPS; `Some(bytes)` => advertise + Client EE
+        // payload `bytes` (empty for Chrome). Leaving the connector's default
+        // (`None`) untouched keeps ALPS off.
+        if let Some(payload) = alps_payload {
+            connector = connector.alps_payload(payload);
+        }
 
         if client.verify() {
             // verify=true → Strict: every chain/hostname/signature failure
@@ -1066,14 +1099,20 @@ impl Session {
             connector = connector.ech_config(ech_config.clone());
         } else if let Some(ech_config) = client.ech_config() {
             connector = connector.ech_config(ech_config.to_vec());
-        } else if let Ok(Some(https_rr)) = client.resolver().lookup_https(host).await {
-            if let Some(ech_bytes) = https_rr.ech_config_list {
-                tracing::debug!(
-                    host = %host,
-                    ech_len = ech_bytes.len(),
-                    "ech.auto_configured_from_dns",
-                );
-                connector = connector.ech_config(ech_bytes);
+        } else if !is_remote_dns {
+            // DNS-based ECH discovery only on routes where we resolve locally.
+            // On remote-DNS routes (socks5h / HTTP CONNECT) the proxy resolves
+            // the target, so a local HTTPS-RR query here would leak the target
+            // hostname out-of-band from the proxy.
+            if let Ok(Some(https_rr)) = client.resolver().lookup_https(host).await {
+                if let Some(ech_bytes) = https_rr.ech_config_list {
+                    tracing::debug!(
+                        host = %host,
+                        ech_len = ech_bytes.len(),
+                        "ech.auto_configured_from_dns",
+                    );
+                    connector = connector.ech_config(ech_bytes);
+                }
             }
         }
 
@@ -1131,6 +1170,7 @@ impl Session {
                         config.tls_profile.clone(),
                         config.alps_payload.clone(),
                         host,
+                        crate::protocol::proxy_uses_remote_dns(proxy),
                     )
                     .await;
 
@@ -1200,16 +1240,11 @@ impl Session {
             "session.h3_connect_start"
         );
 
-        // socks5h: proxy resolves DNS, skip local resolution
-        let is_remote_dns = proxy.is_some_and(|p| {
-            matches!(
-                p.scheme,
-                crate::proxy::ProxyScheme::Socks5 {
-                    remote_dns: true,
-                    ..
-                }
-            )
-        });
+        // Remote-DNS routes (socks5h / HTTP CONNECT): the proxy resolves the
+        // target, so resolving it locally here would leak the target hostname
+        // out-of-band from the proxy. Use the same gate as the TCP path
+        // (`build_tls_connector`) so a new route kind can't reintroduce the leak.
+        let is_remote_dns = crate::protocol::proxy_uses_remote_dns(proxy);
 
         let remote_addr = if is_remote_dns {
             None
@@ -1563,7 +1598,7 @@ impl Session {
             })
             .and_then(|inner| inner);
 
-        let (control_conn, relay_addr) = match associate {
+        let assoc = match associate {
             Ok(value) => value,
             Err(error) => {
                 // UDP ASSOCIATE failed *before* any QUIC bytes ever hit the
@@ -1584,18 +1619,12 @@ impl Session {
             }
         };
 
-        let relay_addr = if relay_addr.ip().is_unspecified() {
-            let proxy_ip = control_conn.peer_addr().map_err(|e| {
-                Error::proxy(
-                    crate::error::ProxyErrorKind::IoError,
-                    format!("failed to get proxy peer address: {e}"),
-                    Some(Box::new(e)),
-                )
-            })?;
-            std::net::SocketAddr::new(proxy_ip.ip(), relay_addr.port())
-        } else {
-            relay_addr
-        };
+        // `first_relay` is hop1's relay (unspecified BND already resolved in
+        // `udp_associate`) — the only address datagrams are sent to directly.
+        // `inner_relays` are the chain's inner-hop relays, stacked as nested
+        // headers. `control_conns` holds every hop's control TCP connection.
+        let relay_addr = assoc.first_relay;
+        let intermediate_relays = assoc.inner_relays;
 
         let bind_addr: std::net::SocketAddr = if relay_addr.is_ipv4() {
             "0.0.0.0:0".parse().unwrap()
@@ -1621,8 +1650,9 @@ impl Session {
         let socks5_socket = Arc::new(Socks5UdpSocket::new(
             local_udp,
             relay_addr,
+            intermediate_relays,
             target,
-            control_conn,
+            assoc.control_conns,
         ));
 
         let quinn_addr = socks5_socket.quinn_addr();
@@ -2341,6 +2371,8 @@ pub struct SessionBuilder {
     client: Client,
     proxy: Option<ProxyConfig>,
     redirect_policy: RedirectPolicy,
+    https_only: bool,
+    hsts_policy: Option<Arc<dyn crate::hsts::HstsPolicy>>,
     retry_policy: Option<Arc<dyn RetryPolicy>>,
     ech_config: Option<Vec<u8>>,
     middlewares: crate::middleware::MiddlewareStack,
@@ -2363,6 +2395,8 @@ impl SessionBuilder {
             client,
             proxy: None,
             redirect_policy: RedirectPolicy::default(),
+            https_only: false,
+            hsts_policy: None,
             retry_policy: None,
             ech_config: None,
             middlewares: Vec::new(),
@@ -2417,10 +2451,60 @@ impl SessionBuilder {
         self
     }
 
+    /// Refuse to follow redirects that leave HTTPS (a downgrade to `http://`).
+    ///
+    /// Default is `false`, matching Chrome's network stack and the reqwest/curl
+    /// defaults: a scheme downgrade is followed, and HSTS pre-upgrade is the
+    /// real protection. Set to `true` to opt into refusing any redirect to a
+    /// non-HTTPS URL — analogous to reqwest's `https_only` / curl's
+    /// `--proto-redir`. Leaving it off keeps behavior byte-identical to Chrome.
+    pub fn https_only(mut self, yes: bool) -> Self {
+        self.https_only = yes;
+        self
+    }
+
+    /// Set the HSTS / scheme-upgrade policy for this session.
+    ///
+    /// Decides whether an `http://` URL (initial request or redirect target) is
+    /// upgraded to `https://` before connecting — the customizable equivalent
+    /// of a browser's HSTS handling. The default is
+    /// [`NoHsts`](crate::hsts::NoHsts): a fresh session is a stateless first
+    /// visit, so nothing is upgraded. Built-ins include
+    /// [`StaticHsts`](crate::hsts::StaticHsts) and
+    /// [`DynamicHsts`](crate::hsts::DynamicHsts); a `Fn(&str) -> bool` closure
+    /// also works. See [`crate::hsts`] for the full rationale.
+    pub fn hsts_policy(mut self, policy: impl crate::hsts::HstsPolicy + 'static) -> Self {
+        self.hsts_policy = Some(Arc::new(policy));
+        self
+    }
+
     /// Set a retry policy for failed requests.
     ///
     /// When set, requests that fail with retryable errors or return retryable
     /// status codes will be automatically retried according to the policy.
+    ///
+    /// # Idempotency / replay safety
+    ///
+    /// Error-based retries are gated on whether the request is **safe to
+    /// replay**, so a non-idempotent request is never silently re-sent after a
+    /// failure that may have already reached the server (RFC 9110 §9.2.2):
+    ///
+    /// - **Safe methods** (`GET`/`HEAD`/`OPTIONS`/`TRACE`) — always retried.
+    /// - **Non-idempotent methods** (`POST`/`PUT`/`PATCH`/`DELETE`, custom
+    ///   methods) — retried **only** when the failure proves the request was
+    ///   never processed (connection-establishment failures, HTTP/2
+    ///   `REFUSED_STREAM`). A timeout, reset, or GOAWAY that occurs *after* the
+    ///   request was transmitted surfaces the error instead of replaying it,
+    ///   to avoid duplicate side effects (e.g. a double `POST`).
+    /// - To opt a non-idempotent request back into full retry/replay (e.g. it
+    ///   carries an `Idempotency-Key`), set
+    ///   [`RequestBuilder::idempotency`](crate::session::RequestBuilder::idempotency)
+    ///   to [`Idempotency::Idempotent`] on that request.
+    ///
+    /// Retryable **status-code** responses (429/502/503/…) are retried
+    /// regardless of method — receiving a response means the server explicitly
+    /// signalled a retry, and this path is unchanged. See [`Idempotency`] and
+    /// [`crate::retry::retry_is_replay_safe`] for the exact rules.
     pub fn retry_policy(mut self, policy: impl RetryPolicy + 'static) -> Self {
         self.retry_policy = Some(Arc::new(policy));
         self
@@ -2698,6 +2782,8 @@ impl SessionBuilder {
             client,
             proxy,
             redirect_policy,
+            https_only,
+            hsts_policy,
             retry_policy,
             ech_config,
             middlewares,
@@ -2751,6 +2837,8 @@ impl SessionBuilder {
                 pool: Mutex::new(pool),
                 proxy,
                 redirect_policy,
+                https_only,
+                hsts_policy: hsts_policy.unwrap_or_else(|| Arc::new(crate::hsts::NoHsts)),
                 session_store,
                 retry_policy,
                 ech_config,
@@ -2801,10 +2889,11 @@ fn materialize_session_fingerprint(client: Client) -> (Client, Arc<InMemorySessi
     // OS entropy. On the vanishingly rare RNG failure, fall through to the base
     // fingerprint rather than panicking inside session construction.
     if SystemRandom::new().fill(&mut seed).is_ok() {
+        let floor = client.randomize().floor();
         let id = if matches!(mode, RandomizeMode::Full(_)) {
-            crate::randomize::resolve_full_identity(seed)
+            crate::randomize::resolve_full_identity(seed, floor)
         } else {
-            crate::randomize::resolve_recombine_identity(seed)
+            crate::randomize::resolve_recombine_identity(seed, floor)
         };
         let client = client.with_synthesized_fingerprint(id, layers);
         // Only isolate the PSK/ticket cache when a crypto-bearing layer (TLS or
@@ -3435,6 +3524,19 @@ mod tests {
                 // google_initial_rtt (0x3127) is NOT a GREASE param — untouched.
                 assert_eq!(extra[2].0, vi(0x3127));
                 assert_eq!(extra[2].1, vec![0x80, 0x09, 0xdf, 0x94]);
+            }
+        }
+
+        #[test]
+        fn randomize_preserves_captured_grease_value_length() {
+            let grease = vi(0x17af394a4ef8da0a);
+            for _ in 0..100 {
+                let mut extra = vec![(grease, vec![0])];
+                let mut order = vec![grease];
+                randomize_quic_grease_params(&mut extra, &mut order);
+                assert_eq!(extra[0].1.len(), 1);
+                assert_ne!(extra[0].0, grease);
+                assert_eq!(order, vec![extra[0].0]);
             }
         }
 

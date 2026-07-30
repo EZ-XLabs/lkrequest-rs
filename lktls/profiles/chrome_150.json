@@ -1,0 +1,93 @@
+{
+  "$schema": "TlsProfile",
+  "$comment": "Chrome 150 TLS profile. Captured from real Chrome 150.0.7871.47 via profile-collector and diffed against Chrome 149. The ONLY wire change vs 149 is signature_algorithms: Chrome 150 prepends three ML-DSA post-quantum codepoints 0x0904/0x0905/0x0906 (2308/2309/2310 = mldsa44/65/87) ahead of the classic 8. Everything else matches 149 — cipher suites, supported_groups (incl. X25519MLKEM768), key_share, ALPN/ALPS, ECH, and H2/Akamai (1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p, hash 52d84b11737d980aef856699f885ca86). This changes JA4 (sig-alg hash) but not JA3. Recapture if a future 150 patch diverges.",
+
+  "name": "Chrome 150",
+
+  "tls_client_hello_style": "chromium_boringssl",
+
+  "tls_min_version": "tls12",
+  "tls_max_version": "tls13",
+
+  "session_id_length": 32,
+
+  "cipher_suites": [
+    4865,  4866,  4867,
+    49195, 49199, 49196, 49200,
+    52393, 52392,
+    49171, 49172,
+    156,   157,
+    47,    53
+  ],
+
+  "compression_methods": [0],
+  "ec_point_formats": [0],
+
+  "supported_groups": [
+    4588, 29, 23, 24
+  ],
+
+  "signature_algorithms": [
+    2308, 2309, 2310,
+    1027, 2052, 1025,
+    1283, 2053, 1281,
+    2054, 1537
+  ],
+
+  "alpn_protocols": ["h2", "http/1.1"],
+
+  "key_share_curves": [4588, 29],
+
+  "compress_cert_algorithms": [2],
+
+  "alps_protocols": ["h2"],
+
+  "grease": {
+    "cipher_suite": true,
+    "extensions": true,
+    "supported_groups": true,
+    "supported_versions": true,
+    "signature_algorithms": false,
+    "key_share": true
+  },
+
+  "randomization": {
+    "shuffle_extensions": true
+  },
+
+  "padding": {
+    "type": "none"
+  },
+
+  "ech": {
+    "type": "grease",
+    "kdf_id": 1,
+    "aead_id": 1,
+    "enc_length": 32,
+    "payload_length_min": 128,
+    "payload_length_max": 224
+  },
+
+  "ech_outer_extensions": [51, 10, 13, 5, 18, 16, 45, 27, 17613],
+
+  "extensions": [
+    { "extension_type": 65535, "source": { "type": "grease" }, "_comment": "GREASE extension (bookend start)" },
+    { "extension_type": 0,     "source": { "type": "auto" }, "_comment": "server_name (SNI)" },
+    { "extension_type": 65037, "source": { "type": "auto" }, "_comment": "encrypted_client_hello (ECH GREASE outer)" },
+    { "extension_type": 16,    "source": { "type": "auto" }, "_comment": "ALPN" },
+    { "extension_type": 43,    "source": { "type": "auto" }, "_comment": "supported_versions" },
+    { "extension_type": 11,    "source": { "type": "auto" }, "_comment": "ec_point_formats" },
+    { "extension_type": 51,    "source": { "type": "auto" }, "_comment": "key_share" },
+    { "extension_type": 35,    "source": { "type": "auto" }, "_comment": "session_ticket" },
+    { "extension_type": 17613, "source": { "type": "auto" }, "_comment": "application_settings (ALPS new 0x44CD)" },
+    { "extension_type": 10,    "source": { "type": "auto" }, "_comment": "supported_groups" },
+    { "extension_type": 65281, "source": { "type": "auto" }, "_comment": "renegotiation_info" },
+    { "extension_type": 23,    "source": { "type": "auto" }, "_comment": "extended_master_secret" },
+    { "extension_type": 18,    "source": { "type": "auto" }, "_comment": "signed_certificate_timestamp (SCT)" },
+    { "extension_type": 45,    "source": { "type": "auto" }, "_comment": "psk_key_exchange_modes" },
+    { "extension_type": 5,     "source": { "type": "auto" }, "_comment": "status_request (OCSP stapling)" },
+    { "extension_type": 27,    "source": { "type": "auto" }, "_comment": "compress_certificate" },
+    { "extension_type": 13,    "source": { "type": "auto" }, "_comment": "signature_algorithms" },
+    { "extension_type": 65535, "source": { "type": "grease" }, "_comment": "GREASE extension (bookend end)" }
+  ]
+}

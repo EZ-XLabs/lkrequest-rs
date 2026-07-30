@@ -16,6 +16,7 @@ fn preset_names() -> &'static [&'static str] {
         "chrome_147",
         "chrome_148",
         "chrome_149",
+        "chrome_150",
         "firefox_133",
         "firefox_147",
         "safari_18",

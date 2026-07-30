@@ -170,8 +170,11 @@ impl ProxyConfig {
             )
         });
 
-        let (control_conn, relay_addr) = match associate {
-            Ok(Ok((control_conn, relay_addr))) => (control_conn, relay_addr),
+        let (control_conns, relay_addr) = match associate {
+            // `udp_associate` already substituted any unspecified BND, so
+            // `first_relay` is concrete. A chain keeps every control connection
+            // alive here for the probe's duration.
+            Ok(Ok(assoc)) => (assoc.control_conns, assoc.first_relay),
             Ok(Err(error)) => {
                 let support = match error.as_proxy_error().map(|err| err.kind) {
                     Some(ProxyErrorKind::Socks5Error { code: 0x07 }) => {
@@ -200,21 +203,8 @@ impl ProxyConfig {
             }
         };
 
-        let relay_addr = if relay_addr.ip().is_unspecified() {
-            let proxy_ip = control_conn.peer_addr().map_err(|e| {
-                Error::proxy(
-                    ProxyErrorKind::IoError,
-                    format!("failed to get proxy peer address: {e}"),
-                    Some(Box::new(e)),
-                )
-            })?;
-            SocketAddr::new(proxy_ip.ip(), relay_addr.port())
-        } else {
-            relay_addr
-        };
-
         if matches!(config.mode, Socks5UdpProbeMode::AssociateOnly) {
-            drop(control_conn);
+            drop(control_conns);
             return Ok(Socks5UdpProbeReport {
                 proxy: proxy_id,
                 support: Socks5UdpProbeSupport::AssociateOk,
@@ -230,7 +220,7 @@ impl ProxyConfig {
             dns_udp_round_trip_through_socks5(relay_addr, &config.target),
         )
         .await;
-        drop(control_conn);
+        drop(control_conns);
 
         match round_trip {
             Ok(Ok(())) => Ok(Socks5UdpProbeReport {

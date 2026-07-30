@@ -350,8 +350,12 @@ pub(crate) struct ConnectConfig {
     pub scheme: Scheme,
     /// TLS fingerprint profile (ignored for Http scheme).
     pub tls_profile: lktls::profile::types::TlsProfile,
-    /// ALPS payload for the TLS handshake (ignored for Http scheme).
-    pub alps_payload: Vec<u8>,
+    /// ALPS state for the TLS handshake (ignored for Http scheme).
+    ///
+    /// `None` => do not advertise ALPS (e.g. H1-only). `Some(bytes)` => advertise
+    /// `application_settings` in the ClientHello and send `bytes` (commonly empty,
+    /// matching real Chrome) as the Client EncryptedExtensions payload.
+    pub alps_payload: Option<Vec<u8>>,
     /// Whether to fall back to direct TCP if proxy connection fails.
     pub proxy_to_direct_fallback: bool,
     /// Time budget for proxy fallback calculation.
@@ -362,7 +366,10 @@ pub(crate) struct ConnectConfig {
 
 impl ConnectConfig {
     /// Create config for a standard HTTPS connection.
-    pub fn https(tls_profile: lktls::profile::types::TlsProfile, alps_payload: Vec<u8>) -> Self {
+    pub fn https(
+        tls_profile: lktls::profile::types::TlsProfile,
+        alps_payload: Option<Vec<u8>>,
+    ) -> Self {
         Self {
             scheme: Scheme::Https,
             tls_profile,
