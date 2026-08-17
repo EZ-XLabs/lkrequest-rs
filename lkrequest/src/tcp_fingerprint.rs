@@ -828,18 +828,262 @@ pub(crate) async fn connect_tcp_with_fingerprint(
     port: u16,
     fingerprint: Option<&TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
+    connect_timeout: Duration,
+    connection_budget: Option<crate::connection_pool::ConnectionBudget>,
 ) -> std::io::Result<tokio::net::TcpStream> {
-    use socket2::{Domain, Protocol, Socket, Type};
-
     let dns_started = std::time::Instant::now();
     let resolved = resolver.resolve(host, port).await;
     crate::diagnostics::record_dns_ms(dns_started.elapsed().as_millis() as u64);
-    let socket_addr = resolved?.into_iter().next().ok_or_else(|| {
-        std::io::Error::new(
+    let addresses = interleave_address_families(resolved?);
+    if addresses.is_empty() {
+        return Err(std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
             format!("DNS resolution returned no addresses for {host}"),
-        )
-    })?;
+        ));
+    }
+
+    dial_tcp_addresses(
+        host,
+        port,
+        addresses,
+        fingerprint.cloned(),
+        connect_timeout,
+        connection_budget,
+    )
+    .await
+}
+
+const HAPPY_EYEBALLS_DELAY: Duration = Duration::from_millis(250);
+const MAX_SERIAL_ATTEMPT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DialAttemptKind {
+    Primary,
+    Speculative,
+}
+
+struct DialAttemptResult {
+    kind: DialAttemptKind,
+    address: std::net::SocketAddr,
+    elapsed: Duration,
+    result: std::io::Result<tokio::net::TcpStream>,
+    _speculative_permit: Option<crate::connection_pool::ConnectionPermit>,
+}
+
+async fn dial_tcp_addresses(
+    host: &str,
+    port: u16,
+    addresses: Vec<std::net::SocketAddr>,
+    fingerprint: Option<TcpFingerprint>,
+    connect_timeout: Duration,
+    connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    let deadline = tokio::time::Instant::now() + connect_timeout;
+    let mut attempts = tokio::task::JoinSet::new();
+    let mut next_address = 0usize;
+    let mut primary_active = false;
+    let mut speculative_active = false;
+    let mut primary_started = None;
+    let mut primary_cutoff = None;
+    let mut primary_abort = None;
+    let mut primary_address = None;
+    let mut errors = Vec::new();
+
+    loop {
+        if !primary_active && next_address < addresses.len() {
+            let address = addresses[next_address];
+            next_address += 1;
+            let started = tokio::time::Instant::now();
+            let remaining_candidates = addresses.len() - next_address + 1;
+            let remaining = deadline.saturating_duration_since(started);
+            let fair_share = remaining / u32::try_from(remaining_candidates).unwrap_or(u32::MAX);
+            let serial_window = fair_share.max(HAPPY_EYEBALLS_DELAY).min(MAX_SERIAL_ATTEMPT);
+
+            primary_started = Some(started);
+            primary_cutoff = Some(started + serial_window.min(remaining));
+            primary_active = true;
+            primary_address = Some(address);
+            primary_abort = Some(spawn_dial_attempt(
+                &mut attempts,
+                DialAttemptKind::Primary,
+                address,
+                fingerprint.clone(),
+                None,
+            ));
+        }
+
+        if !primary_active && !speculative_active && next_address >= addresses.len() {
+            break;
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            attempts.abort_all();
+            while attempts.join_next().await.is_some() {}
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("TCP connect to {host}:{port} timed out after {connect_timeout:?}"),
+            ));
+        }
+
+        let fallback_at = primary_started.map(|started| started + HAPPY_EYEBALLS_DELAY);
+        let next_timer = [Some(deadline), fallback_at, primary_cutoff]
+            .into_iter()
+            .flatten()
+            .filter(|instant| *instant > now)
+            .min()
+            .unwrap_or(deadline);
+
+        tokio::select! {
+            joined = attempts.join_next(), if !attempts.is_empty() => {
+                let Some(joined) = joined else { continue };
+                let attempt = joined.map_err(|error| {
+                    std::io::Error::other(format!("TCP dial task failed: {error}"))
+                })?;
+
+                match attempt.kind {
+                    DialAttemptKind::Primary => {
+                        primary_active = false;
+                        primary_started = None;
+                        primary_cutoff = None;
+                        primary_abort = None;
+                        primary_address = None;
+                    }
+                    DialAttemptKind::Speculative => speculative_active = false,
+                }
+
+                match attempt.result {
+                    Ok(stream) => {
+                        attempts.abort_all();
+                        while attempts.join_next().await.is_some() {}
+                        drop(attempt._speculative_permit);
+                        crate::diagnostics::record_tcp_ms(attempt.elapsed.as_millis() as u64);
+                        crate::diagnostics::record_remote_addr(attempt.address.to_string());
+                        return Ok(stream);
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            address = %attempt.address,
+                            error = %error,
+                            attempt = ?attempt.kind,
+                            "tcp.connect_address_failed"
+                        );
+                        errors.push((attempt.address, error));
+                        if attempt.kind == DialAttemptKind::Speculative
+                            && primary_active
+                            && next_address < addresses.len()
+                        {
+                            let restarted = tokio::time::Instant::now();
+                            let remaining_candidates = addresses.len() - next_address + 1;
+                            let remaining = deadline.saturating_duration_since(restarted);
+                            let fair_share = remaining
+                                / u32::try_from(remaining_candidates).unwrap_or(u32::MAX);
+                            let serial_window = fair_share
+                                .max(HAPPY_EYEBALLS_DELAY)
+                                .min(MAX_SERIAL_ATTEMPT);
+                            primary_started = Some(restarted);
+                            primary_cutoff = Some(restarted + serial_window.min(remaining));
+                        }
+                    }
+                }
+            }
+            _ = tokio::time::sleep_until(next_timer) => {
+                let now = tokio::time::Instant::now();
+                if now >= deadline {
+                    continue;
+                }
+
+                let fallback_due = primary_active
+                    && !speculative_active
+                    && next_address < addresses.len()
+                    && fallback_at.is_some_and(|instant| now >= instant);
+
+                if fallback_due {
+                    let speculative_permit = match connection_budget.as_ref() {
+                        Some(budget) => budget.try_reserve_speculative().map(Some),
+                        None => Some(None),
+                    };
+
+                    if let Some(speculative_permit) = speculative_permit {
+                        let address = addresses[next_address];
+                        next_address += 1;
+                        speculative_active = true;
+                        primary_cutoff = None;
+                        spawn_dial_attempt(
+                            &mut attempts,
+                            DialAttemptKind::Speculative,
+                            address,
+                            fingerprint.clone(),
+                            speculative_permit,
+                        );
+                        continue;
+                    }
+                }
+
+                let serial_cutoff_due = primary_active
+                    && !speculative_active
+                    && next_address < addresses.len()
+                    && primary_cutoff.is_some_and(|instant| now >= instant);
+                if serial_cutoff_due {
+                    if let Some(abort) = primary_abort.take() {
+                        abort.abort();
+                    }
+                    let _ = attempts.join_next().await;
+                    primary_active = false;
+                    primary_started = None;
+                    primary_cutoff = None;
+                    errors.push((
+                        primary_address.take().expect("active primary has an address"),
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "address attempt exceeded its serial fallback window",
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    let last_kind = errors
+        .last()
+        .map(|(_, error)| error.kind())
+        .unwrap_or(std::io::ErrorKind::AddrNotAvailable);
+    let details = errors
+        .iter()
+        .map(|(address, error)| format!("{address}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(std::io::Error::new(
+        last_kind,
+        format!("TCP connect to {host}:{port} failed for all addresses: {details}"),
+    ))
+}
+
+fn spawn_dial_attempt(
+    attempts: &mut tokio::task::JoinSet<DialAttemptResult>,
+    kind: DialAttemptKind,
+    address: std::net::SocketAddr,
+    fingerprint: Option<TcpFingerprint>,
+    speculative_permit: Option<crate::connection_pool::ConnectionPermit>,
+) -> tokio::task::AbortHandle {
+    attempts.spawn(async move {
+        let started = std::time::Instant::now();
+        let result = dial_tcp_address(address, fingerprint.as_ref()).await;
+        DialAttemptResult {
+            kind,
+            address,
+            elapsed: started.elapsed(),
+            result,
+            _speculative_permit: speculative_permit,
+        }
+    })
+}
+
+async fn dial_tcp_address(
+    socket_addr: std::net::SocketAddr,
+    fingerprint: Option<&TcpFingerprint>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    use socket2::{Domain, Protocol, Socket, Type};
 
     let domain = if socket_addr.is_ipv4() {
         Domain::IPV4
@@ -878,19 +1122,48 @@ pub(crate) async fn connect_tcp_with_fingerprint(
     let stream = tokio::net::TcpStream::from_std(std_stream)?;
 
     // Wait for the connection to complete
-    let tcp_started = std::time::Instant::now();
     stream.writable().await?;
 
     // Check for connection errors
     if let Some(e) = stream.take_error()? {
         return Err(e);
     }
-    crate::diagnostics::record_tcp_ms(tcp_started.elapsed().as_millis() as u64);
-    if let Ok(addr) = stream.peer_addr() {
-        crate::diagnostics::record_remote_addr(addr.to_string());
+    Ok(stream)
+}
+
+pub(crate) fn interleave_address_families(
+    addresses: Vec<std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let Some(first) = addresses.first() else {
+        return addresses;
+    };
+    let prefer_ipv6 = first.is_ipv6();
+    let mut ipv4 = addresses.iter().copied().filter(|addr| addr.is_ipv4());
+    let mut ipv6 = addresses.iter().copied().filter(|addr| addr.is_ipv6());
+    let mut interleaved = Vec::with_capacity(addresses.len());
+
+    loop {
+        let preferred = if prefer_ipv6 {
+            ipv6.next()
+        } else {
+            ipv4.next()
+        };
+        let fallback = if prefer_ipv6 {
+            ipv4.next()
+        } else {
+            ipv6.next()
+        };
+        match (preferred, fallback) {
+            (None, None) => break,
+            (Some(address), None) | (None, Some(address)) => interleaved.push(address),
+            (Some(preferred), Some(fallback)) => {
+                interleaved.push(preferred);
+                interleaved.push(fallback);
+            }
+        }
     }
 
-    Ok(stream)
+    interleaved
 }
 
 /// Platform-specific "in progress" error code for non-blocking connect.
@@ -912,6 +1185,60 @@ fn connect_in_progress_code() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct StaticResolver {
+        addresses: Vec<std::net::SocketAddr>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::DnsResolver for StaticResolver {
+        async fn resolve(
+            &self,
+            _host: &str,
+            _port: u16,
+        ) -> std::io::Result<Vec<std::net::SocketAddr>> {
+            Ok(self.addresses.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_falls_back_when_first_dns_address_is_unreachable() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let resolver = StaticResolver {
+            addresses: vec![
+                std::net::SocketAddr::new(std::net::Ipv6Addr::LOCALHOST.into(), port),
+                std::net::SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), port),
+            ],
+        };
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mut pool = crate::connection_pool::ConnectionPool::with_max_total(1);
+        let _primary_permit = pool
+            .try_reserve_connection()
+            .expect("primary dial reservation");
+        let budget = pool.connection_budget();
+        assert!(budget.try_reserve_speculative().is_none());
+
+        let stream = connect_tcp_with_fingerprint(
+            "multi-address.test",
+            port,
+            None,
+            &resolver,
+            Duration::from_secs(5),
+            Some(budget),
+        )
+        .await
+        .expect("the IPv4 address should be tried after IPv6 fails");
+
+        assert_eq!(
+            stream.peer_addr().unwrap().ip(),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        accept.await.unwrap();
+    }
 
     // -- JA4T parsing --
 

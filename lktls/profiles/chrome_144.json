@@ -1,6 +1,6 @@
 {
   "$schema": "TlsProfile",
-  "$comment": "Chrome 144 TLS Fingerprint Profile. Captured from a real Chrome 144.0.0.0 browser on Windows 10. Data source: example.com. JA3 hash: 991d71ee69967b7325077b71bad10393. JA4: t13d1516h2_8daaf6152771_d8a2da3f94cd.",
+  "$comment": "Chrome 144 TLS Fingerprint Profile. Captured from a real Chrome 144.0.0.0 browser on Windows 10. Data source: tls.browserleaks.com. JA3 hash: 991d71ee69967b7325077b71bad10393. JA4: t13d1516h2_8daaf6152771_d8a2da3f94cd.",
 
   "name": "Chrome 144",
 

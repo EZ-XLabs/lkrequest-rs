@@ -24,6 +24,9 @@ jobs:
       - name: Cargo test (workspace, Tier 0 — no ignored tests)
         run: cargo test --workspace
 
+      - name: Remove standard test build artifacts
+        run: cargo clean
+
       - name: LLVM coverage (core crates; threshold is a floor — raise over time)
         run: >
           cargo llvm-cov test

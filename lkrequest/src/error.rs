@@ -746,7 +746,10 @@ fn classify_connection_closed_message(message: &str) -> Option<ConnectionClosedK
         Some(ConnectionClosedKind::BrokenPipe)
     } else if m.contains("not connected") || m.contains("connection shut down") {
         Some(ConnectionClosedKind::NotConnected)
-    } else if m.contains("channel closed") {
+    } else if m.contains("channel closed")
+        || m.contains("operation was canceled")
+        || m.contains("operation was cancelled")
+    {
         Some(ConnectionClosedKind::ChannelClosed)
     } else if m.contains("unexpected eof") || m.contains("empty response") {
         Some(ConnectionClosedKind::Eof)
@@ -858,6 +861,20 @@ mod tests {
         assert!(Error::Http("stale pooled connection closed by peer".into()).is_connection_closed());
         assert!(Error::Http("write failed: connection reset by peer".into()).is_connection_closed());
         assert!(!Error::Http("invalid response header".into()).is_connection_closed());
+    }
+
+    #[test]
+    fn hyper_canceled_h1_request_is_connection_closed() {
+        let err = Error::http_or_connection_closed(
+            ConnectionPhase::HttpRequest,
+            "HTTP/1.1 request failed: operation was canceled",
+        );
+
+        assert!(err.is_connection_closed());
+        assert_eq!(
+            err.connection_closed_kind(),
+            Some(ConnectionClosedKind::ChannelClosed)
+        );
     }
 
     #[test]

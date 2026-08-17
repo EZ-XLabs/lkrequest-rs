@@ -26,9 +26,36 @@ impl ProxyConfig {
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
     ) -> Result<TcpStream> {
+        self.connect_with_budget(
+            target_host,
+            target_port,
+            tcp_fingerprint,
+            resolver,
+            std::time::Duration::from_secs(10),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_budget(
+        &self,
+        target_host: &str,
+        target_port: u16,
+        tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
+        resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: std::time::Duration,
+        connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+    ) -> Result<TcpStream> {
         if !self.chain.is_empty() {
             return self
-                .connect_chain(target_host, target_port, tcp_fingerprint, resolver)
+                .connect_chain(
+                    target_host,
+                    target_port,
+                    tcp_fingerprint,
+                    resolver,
+                    connect_timeout,
+                    connection_budget,
+                )
                 .await;
         }
         match &self.scheme {
@@ -40,6 +67,8 @@ impl ProxyConfig {
                     target_port,
                     tcp_fingerprint,
                     resolver,
+                    connect_timeout,
+                    connection_budget,
                 )
                 .await
             }
@@ -56,12 +85,13 @@ impl ProxyConfig {
                     *remote_dns,
                     tcp_fingerprint,
                     resolver,
+                    connect_timeout,
+                    connection_budget,
                 )
                 .await
             }
         }
     }
-
     /// Establish a TCP tunnel through a multi-hop **proxychain** to the target.
     ///
     /// Physical path: TCP-connect to the first hop, then CONNECT-tunnel through
@@ -76,48 +106,123 @@ impl ProxyConfig {
         target_port: u16,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: std::time::Duration,
+        connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     ) -> Result<TcpStream> {
-        // Ordered hops: the upstream chain, then `self` (final hop → target).
         let hops: Vec<&ProxyConfig> = self.chain.iter().chain(std::iter::once(self)).collect();
         let (first_host, first_port) = hops[0].host_port();
         let first_host = first_host.to_string();
+        let final_targets = if matches!(
+            self.scheme,
+            ProxyScheme::Socks5 {
+                remote_dns: false,
+                ..
+            }
+        ) {
+            let addresses =
+                resolver
+                    .resolve(target_host, target_port)
+                    .await
+                    .map_err(|error| {
+                        Error::proxy(
+                    ProxyErrorKind::IoError,
+                    format!("SOCKS5 chain target DNS resolution failed for {target_host}: {error}"),
+                    Some(Box::new(error)),
+                )
+                    })?;
+            crate::tcp_fingerprint::interleave_address_families(addresses)
+                .into_iter()
+                .map(Some)
+                .collect::<Vec<_>>()
+        } else {
+            vec![None]
+        };
+        if final_targets.is_empty() {
+            return Err(Error::proxy(
+                ProxyErrorKind::IoError,
+                format!("SOCKS5 chain target DNS returned no addresses for {target_host}"),
+                None,
+            ));
+        }
 
-        let span = tracing::debug_span!(
-            "proxy.chain",
-            hops = hops.len(),
-            first = %format_args!("{}:{}", first_host, first_port),
-            target = %format_args!("{}:{}", target_host, target_port),
-        );
+        let mut failures = Vec::new();
+        for final_target in final_targets {
+            let mut stream = connect_tcp_to_proxy_with_budget(
+                &first_host,
+                first_port,
+                tcp_fingerprint,
+                resolver,
+                connect_timeout,
+                connection_budget.clone(),
+            )
+            .await?;
 
-        async move {
-            // Only the first hop gets a real SYN from us → apply tcp_fingerprint here.
-            let mut stream =
-                connect_tcp_to_proxy(&first_host, first_port, tcp_fingerprint, resolver).await?;
-            tracing::debug!("proxy.chain.tcp_connected");
-
+            let mut failed = None;
             for i in 0..hops.len() {
-                let (next_host, next_port) = if i + 1 < hops.len() {
-                    hops[i + 1].host_port()
+                let result = if i + 1 == hops.len() {
+                    match final_target {
+                        Some(target) => hops[i].negotiate_over_address(&mut stream, target).await,
+                        None => {
+                            hops[i]
+                                .negotiate_over(&mut stream, target_host, target_port, resolver)
+                                .await
+                        }
+                    }
                 } else {
-                    (target_host, target_port)
+                    let (next_host, next_port) = hops[i + 1].host_port();
+                    hops[i]
+                        .negotiate_over(&mut stream, next_host, next_port, resolver)
+                        .await
                 };
-                hops[i]
-                    .negotiate_over(&mut stream, next_host, next_port, resolver)
-                    .await?;
-                tracing::debug!(hop = i, "proxy.chain.hop_established");
+                if let Err(error) = result {
+                    failed = Some((i, error));
+                    break;
+                }
             }
 
-            tracing::debug!("proxy.chain.tunnel_established");
-            Ok(stream)
+            match failed {
+                None => return Ok(stream),
+                Some((failed_hop, error))
+                    if failed_hop + 1 == hops.len()
+                        && final_target.is_some()
+                        && is_retryable_socks5_target_error(&error) =>
+                {
+                    failures.push(format!("{}: {error}", final_target.unwrap()));
+                }
+                Some((_, error)) => return Err(error),
+            }
         }
-        .instrument(span)
-        .await
-    }
 
+        Err(Error::proxy(
+            ProxyErrorKind::IoError,
+            format!(
+                "SOCKS5 chain target connect failed for all addresses: {}",
+                failures.join("; ")
+            ),
+            None,
+        ))
+    }
     /// Negotiate this proxy's CONNECT to `(host, port)` over an already-open
     /// stream (one hop of a chain). Unlike the single-hop HTTP path this does
     /// not retry on 407 by reconnecting — a mid-chain TCP cannot be re-opened,
     /// so credentials must be supplied up front.
+    async fn negotiate_over_address(
+        &self,
+        stream: &mut TcpStream,
+        target: SocketAddr,
+    ) -> Result<()> {
+        if !matches!(self.scheme, ProxyScheme::Socks5 { .. }) {
+            return Err(Error::proxy(
+                ProxyErrorKind::ProtocolError,
+                "address-specific negotiation requires a SOCKS5 hop",
+                None,
+            ));
+        }
+        socks5_handshake(stream, self.auth.as_ref()).await?;
+        socks5_send_connect_address(stream, target).await?;
+        socks5_read_response(stream, "connect").await?;
+        Ok(())
+    }
     async fn negotiate_over(
         &self,
         stream: &mut TcpStream,
@@ -169,6 +274,7 @@ impl ProxyConfig {
     /// TLS handshake that follows. A bulk `read()` could pull in TLS data beyond
     /// the HTTP header boundary, causing the subsequent TLS handshake to fail
     /// (the over-read bytes would be lost from the stream).
+    #[allow(clippy::too_many_arguments)]
     async fn connect_http(
         &self,
         proxy_host: &str,
@@ -177,6 +283,8 @@ impl ProxyConfig {
         target_port: u16,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: std::time::Duration,
+        connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     ) -> Result<TcpStream> {
         let span = tracing::debug_span!(
             "proxy.tunnel",
@@ -189,8 +297,15 @@ impl ProxyConfig {
             let proxy_addr = format!("{}:{}", proxy_host, proxy_port);
             let target = format!("{}:{}", target_host, target_port);
 
-            let mut stream =
-                connect_tcp_to_proxy(proxy_host, proxy_port, tcp_fingerprint, resolver).await?;
+            let mut stream = connect_tcp_to_proxy_with_budget(
+                proxy_host,
+                proxy_port,
+                tcp_fingerprint,
+                resolver,
+                connect_timeout,
+                connection_budget.clone(),
+            )
+            .await?;
 
             tracing::debug!("proxy.tcp_connected");
 
@@ -216,16 +331,22 @@ impl ProxyConfig {
                     );
 
                     drop(stream);
-                    let mut stream2 =
-                        connect_tcp_to_proxy(proxy_host, proxy_port, tcp_fingerprint, resolver)
-                            .await
-                            .map_err(|e| {
-                                Error::proxy(
+                    let mut stream2 = connect_tcp_to_proxy_with_budget(
+                        proxy_host,
+                        proxy_port,
+                        tcp_fingerprint,
+                        resolver,
+                        connect_timeout,
+                        connection_budget.clone(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        Error::proxy(
                             ProxyErrorKind::TcpConnectFailed,
                             format!("failed to reconnect to proxy {proxy_addr} for 407 retry: {e}"),
                             Some(Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
                         )
-                            })?;
+                    })?;
 
                     let (retry_code, _) =
                         send_connect_request(&mut stream2, &target, self.auth.as_ref()).await?;
@@ -279,6 +400,8 @@ impl ProxyConfig {
         remote_dns: bool,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: std::time::Duration,
+        connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     ) -> Result<TcpStream> {
         let span = tracing::debug_span!(
             "proxy.tunnel",
@@ -295,6 +418,8 @@ impl ProxyConfig {
             remote_dns,
             tcp_fingerprint,
             resolver,
+            connect_timeout,
+            connection_budget,
         )
         .instrument(span)
         .await
@@ -311,29 +436,76 @@ impl ProxyConfig {
         remote_dns: bool,
         tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
         resolver: &dyn crate::dns::DnsResolver,
+        connect_timeout: std::time::Duration,
+        connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     ) -> Result<TcpStream> {
-        let mut stream = connect_tcp_to_proxy(proxy_host, proxy_port, tcp_fingerprint, resolver)
-            .await
-            .map_err(|e| {
-                Error::proxy(
-                    ProxyErrorKind::TcpConnectFailed,
-                    format!("failed to connect to SOCKS5 proxy {proxy_host}:{proxy_port}: {e}"),
-                    Some(Box::new(e)),
-                )
-            })?;
+        if remote_dns {
+            let mut stream = connect_tcp_to_proxy_with_budget(
+                proxy_host,
+                proxy_port,
+                tcp_fingerprint,
+                resolver,
+                connect_timeout,
+                connection_budget,
+            )
+            .await?;
+            socks5_handshake(&mut stream, self.auth.as_ref()).await?;
+            socks5_send_connect(&mut stream, target_host, target_port, true, resolver).await?;
+            socks5_read_response(&mut stream, "connect").await?;
+            return Ok(stream);
+        }
 
-        tracing::debug!("proxy.tcp_connected");
+        let addresses = crate::tcp_fingerprint::interleave_address_families(
+            resolver
+                .resolve(target_host, target_port)
+                .await
+                .map_err(|error| {
+                    Error::proxy(
+                        ProxyErrorKind::IoError,
+                        format!("SOCKS5 local DNS resolution failed for {target_host}: {error}"),
+                        Some(Box::new(error)),
+                    )
+                })?,
+        );
+        if addresses.is_empty() {
+            return Err(Error::proxy(
+                ProxyErrorKind::IoError,
+                format!("SOCKS5 local DNS resolution returned no addresses for {target_host}"),
+                None,
+            ));
+        }
 
-        socks5_handshake(&mut stream, self.auth.as_ref()).await?;
+        let mut failures = Vec::new();
+        for target in addresses {
+            let mut stream = connect_tcp_to_proxy_with_budget(
+                proxy_host,
+                proxy_port,
+                tcp_fingerprint,
+                resolver,
+                connect_timeout,
+                connection_budget.clone(),
+            )
+            .await?;
+            socks5_handshake(&mut stream, self.auth.as_ref()).await?;
+            socks5_send_connect_address(&mut stream, target).await?;
+            match socks5_read_response(&mut stream, "connect").await {
+                Ok(_) => return Ok(stream),
+                Err(error) if is_retryable_socks5_target_error(&error) => {
+                    failures.push(format!("{target}: {error}"));
+                }
+                Err(error) => return Err(error),
+            }
+        }
 
-        socks5_send_connect(&mut stream, target_host, target_port, remote_dns, resolver).await?;
-
-        let _bound_addr = socks5_read_response(&mut stream, "connect").await?;
-
-        tracing::debug!("proxy.tunnel_established");
-        Ok(stream)
+        Err(Error::proxy(
+            ProxyErrorKind::IoError,
+            format!(
+                "SOCKS5 target connect failed for all locally resolved addresses: {}",
+                failures.join("; ")
+            ),
+            None,
+        ))
     }
-
     /// Establish a SOCKS5 UDP ASSOCIATE session through this proxy (single hop
     /// or a nested **proxy chain**).
     ///
@@ -700,6 +872,38 @@ async fn socks5_send_connect(
     Ok(())
 }
 
+async fn socks5_send_connect_address(stream: &mut TcpStream, target: SocketAddr) -> Result<()> {
+    let mut request = vec![0x05, 0x01, 0x00];
+    match target {
+        SocketAddr::V4(address) => {
+            request.push(0x01);
+            request.extend_from_slice(&address.ip().octets());
+        }
+        SocketAddr::V6(address) => {
+            request.push(0x04);
+            request.extend_from_slice(&address.ip().octets());
+        }
+    }
+    request.extend_from_slice(&target.port().to_be_bytes());
+    stream.write_all(&request).await.map_err(|error| {
+        Error::proxy(
+            ProxyErrorKind::IoError,
+            format!("SOCKS5 connect request failed: {error}"),
+            Some(Box::new(error)),
+        )
+    })
+}
+
+fn is_retryable_socks5_target_error(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::Proxy(proxy_error)
+            if matches!(
+                proxy_error.kind,
+                ProxyErrorKind::Socks5Error { code: 0x01 | 0x03 | 0x04 | 0x05 | 0x06 | 0x08 }
+            )
+    )
+}
 /// Read and validate a SOCKS5 command response, returning the bound address.
 async fn socks5_read_response(stream: &mut TcpStream, cmd_name: &str) -> Result<SocketAddr> {
     let mut resp_header = [0u8; 4];
@@ -869,11 +1073,32 @@ async fn connect_tcp_to_proxy(
     tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
 ) -> Result<TcpStream> {
+    connect_tcp_to_proxy_with_budget(
+        proxy_host,
+        proxy_port,
+        tcp_fingerprint,
+        resolver,
+        std::time::Duration::from_secs(10),
+        None,
+    )
+    .await
+}
+
+async fn connect_tcp_to_proxy_with_budget(
+    proxy_host: &str,
+    proxy_port: u16,
+    tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
+    resolver: &dyn crate::dns::DnsResolver,
+    connect_timeout: std::time::Duration,
+    connection_budget: Option<crate::connection_pool::ConnectionBudget>,
+) -> Result<TcpStream> {
     crate::tcp_fingerprint::connect_tcp_with_fingerprint(
         proxy_host,
         proxy_port,
         tcp_fingerprint,
         resolver,
+        connect_timeout,
+        connection_budget,
     )
     .await
     .map_err(|e| {
@@ -884,7 +1109,6 @@ async fn connect_tcp_to_proxy(
         )
     })
 }
-
 /// Send an HTTP CONNECT request and read the response headers byte-by-byte.
 ///
 /// Returns `(status_code, raw_response_bytes)`. The byte-by-byte read ensures
@@ -948,4 +1172,319 @@ async fn send_connect_request(
     let status_code = super::config::parse_http_status(status_line).unwrap_or(0);
 
     Ok((status_code, response_bytes))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct StaticResolver {
+        addresses: Vec<SocketAddr>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::dns::DnsResolver for StaticResolver {
+        async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            if host == "127.0.0.1" {
+                return Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]);
+            }
+            Ok(self
+                .addresses
+                .iter()
+                .map(|address| SocketAddr::new(address.ip(), port))
+                .collect())
+        }
+    }
+
+    async fn serve_socks_attempt(listener: &tokio::net::TcpListener, reply: u8) -> u8 {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).await.unwrap();
+        stream.write_all(&[0x05, 0x00]).await.unwrap();
+        let mut header = [0u8; 4];
+        stream.read_exact(&mut header).await.unwrap();
+        let address_len = match header[3] {
+            0x01 => 4,
+            0x03 => {
+                let mut length = [0u8; 1];
+                stream.read_exact(&mut length).await.unwrap();
+                length[0] as usize
+            }
+            0x04 => 16,
+            other => panic!("unexpected ATYP {other:#x}"),
+        };
+        let mut address_and_port = vec![0u8; address_len + 2];
+        stream.read_exact(&mut address_and_port).await.unwrap();
+        stream
+            .write_all(&[0x05, reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        header[3]
+    }
+
+    #[tokio::test]
+    async fn socks5_local_dns_retries_next_address() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            assert_eq!(serve_socks_attempt(&listener, 0x03).await, 0x04);
+            assert_eq!(serve_socks_attempt(&listener, 0x00).await, 0x01);
+        });
+        let proxy = ProxyConfig::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: vec![
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+            ],
+        };
+
+        let stream = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect("SOCKS5 should reconnect with the next locally resolved address");
+
+        drop(stream);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5h_sends_domain_without_local_target_resolution() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { serve_socks_attempt(&listener, 0x00).await });
+        let proxy = ProxyConfig::parse(&format!("socks5h://127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+
+        let stream = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect("socks5h should send the hostname to the proxy");
+
+        drop(stream);
+        assert_eq!(server.await.unwrap(), 0x03);
+    }
+
+    fn socks_error(code: u8) -> Error {
+        Error::proxy(
+            ProxyErrorKind::Socks5Error { code },
+            format!("SOCKS5 error {code:#x}"),
+            None,
+        )
+    }
+
+    #[test]
+    fn socks5_retryable_error_matrix() {
+        for code in [0x01, 0x03, 0x04, 0x05, 0x06, 0x08] {
+            assert!(is_retryable_socks5_target_error(&socks_error(code)));
+        }
+        for code in [0x02, 0x07, 0x09] {
+            assert!(!is_retryable_socks5_target_error(&socks_error(code)));
+        }
+    }
+
+    #[test]
+    fn socks5_candidates_interleave_address_families() {
+        let addresses = vec![
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 443)),
+            SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+        ];
+        let interleaved = crate::tcp_fingerprint::interleave_address_families(addresses);
+        assert!(interleaved[0].is_ipv6());
+        assert!(interleaved[1].is_ipv4());
+        assert!(interleaved[2].is_ipv6());
+    }
+
+    #[tokio::test]
+    async fn socks5_all_candidates_fail_with_aggregate_error() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            serve_socks_attempt(&listener, 0x03).await;
+            serve_socks_attempt(&listener, 0x05).await;
+        });
+        let proxy = ProxyConfig::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: vec![
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+            ],
+        };
+
+        let error = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect_err("all target candidates should fail");
+        let message = error.to_string();
+        assert!(message.contains("network unreachable"));
+        assert!(message.contains("connection refused"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks5_non_retryable_error_stops_after_first_attempt() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { serve_socks_attempt(&listener, 0x02).await });
+        let proxy = ProxyConfig::parse(&format!("socks5://127.0.0.1:{port}")).unwrap();
+        let resolver = StaticResolver {
+            addresses: vec![
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+            ],
+        };
+
+        let error = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect_err("ruleset denial must not retry another target");
+        assert!(error
+            .to_string()
+            .contains("connection not allowed by ruleset"));
+        assert_eq!(server.await.unwrap(), 0x04);
+    }
+
+    struct FailingResolver;
+
+    #[async_trait::async_trait]
+    impl crate::dns::DnsResolver for FailingResolver {
+        async fn resolve(&self, _host: &str, _port: u16) -> std::io::Result<Vec<SocketAddr>> {
+            Err(std::io::Error::other("synthetic DNS failure"))
+        }
+    }
+
+    #[tokio::test]
+    async fn socks5_local_dns_empty_result_fails_before_proxy_connect() {
+        let proxy = ProxyConfig::parse("socks5://127.0.0.1:9").unwrap();
+        let resolver = StaticResolver {
+            addresses: Vec::new(),
+        };
+
+        let error = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect_err("empty local DNS results must fail explicitly");
+
+        assert!(error.to_string().contains("returned no addresses"));
+    }
+
+    #[tokio::test]
+    async fn socks5_local_dns_error_preserves_resolution_context() {
+        let proxy = ProxyConfig::parse("socks5://127.0.0.1:9").unwrap();
+
+        let error = proxy
+            .connect("target.test", 443, None, &FailingResolver)
+            .await
+            .expect_err("local DNS errors must be reported before proxy connect");
+
+        let message = error.to_string();
+        assert!(message.contains("local DNS resolution failed"));
+        assert!(message.contains("synthetic DNS failure"));
+    }
+
+    #[tokio::test]
+    async fn socks5_chain_does_not_retry_target_after_intermediate_hop_failure() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let first_port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move { serve_socks_attempt(&listener, 0x03).await });
+        let proxy = ProxyConfig::parse_chain(&[
+            format!("socks5://127.0.0.1:{first_port}"),
+            "socks5://127.0.0.1:1081".to_string(),
+        ])
+        .unwrap();
+        let resolver = StaticResolver {
+            addresses: vec![
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+            ],
+        };
+
+        let error = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect_err("an intermediate hop failure must stop the chain");
+
+        assert!(error.to_string().contains("network unreachable"));
+        assert_eq!(server.await.unwrap(), 0x01);
+    }
+
+    async fn serve_socks_relay_attempt(
+        listener: &tokio::net::TcpListener,
+        next_hop: SocketAddr,
+    ) -> u8 {
+        let (mut client, _) = listener.accept().await.unwrap();
+        let mut greeting = [0u8; 3];
+        client.read_exact(&mut greeting).await.unwrap();
+        client.write_all(&[0x05, 0x00]).await.unwrap();
+        let mut header = [0u8; 4];
+        client.read_exact(&mut header).await.unwrap();
+        assert_eq!(header[3], 0x01);
+        let mut address_and_port = [0u8; 6];
+        client.read_exact(&mut address_and_port).await.unwrap();
+        client
+            .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut upstream = TcpStream::connect(next_hop).await.unwrap();
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+        header[3]
+    }
+
+    #[tokio::test]
+    async fn socks5_chain_rebuilds_for_next_final_target_address() {
+        let first_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let final_listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let first_port = first_listener.local_addr().unwrap().port();
+        let final_addr = final_listener.local_addr().unwrap();
+        let first_server = tokio::spawn(async move {
+            assert_eq!(
+                serve_socks_relay_attempt(&first_listener, final_addr).await,
+                0x01
+            );
+            assert_eq!(
+                serve_socks_relay_attempt(&first_listener, final_addr).await,
+                0x01
+            );
+        });
+        let final_server = tokio::spawn(async move {
+            assert_eq!(serve_socks_attempt(&final_listener, 0x03).await, 0x04);
+            assert_eq!(serve_socks_attempt(&final_listener, 0x00).await, 0x01);
+        });
+        let proxy = ProxyConfig::parse_chain(&[
+            format!("socks5://127.0.0.1:{first_port}"),
+            format!("socks5://127.0.0.1:{}", final_addr.port()),
+        ])
+        .unwrap();
+        let resolver = StaticResolver {
+            addresses: vec![
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 443)),
+                SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 443)),
+            ],
+        };
+
+        let stream = proxy
+            .connect("target.test", 443, None, &resolver)
+            .await
+            .expect("the full SOCKS5 chain should be rebuilt for the next target address");
+
+        drop(stream);
+        first_server.await.unwrap();
+        final_server.await.unwrap();
+    }
 }

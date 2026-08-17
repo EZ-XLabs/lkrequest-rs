@@ -144,7 +144,7 @@ pub enum HandshakeAction {
     /// The handshake is complete. The caller should:
     /// 1. Send `client_finished` encrypted with the handshake write key.
     /// 2. Install the application traffic keys.
-    Complete(HandshakeComplete),
+    Complete(Box<HandshakeComplete>),
 
     /// HelloRetryRequest received. Send this new ClientHello (plaintext).
     RetryClientHello(Vec<u8>),
@@ -178,6 +178,9 @@ pub struct HandshakeComplete {
     /// Must be sent *before* `client_finished`, encrypted with handshake keys.
     /// `None` if ALPS was not negotiated.
     pub client_encrypted_extensions: Option<Vec<u8>>,
+    /// Empty client Certificate message sent when the server requested client
+    /// authentication but no client certificate is configured.
+    pub client_certificate: Option<Vec<u8>>,
     /// Client Finished handshake message bytes (to be sent encrypted
     /// with the handshake write key, NOT the application key).
     pub client_finished: Vec<u8>,
@@ -314,6 +317,8 @@ pub struct Tls13Handshake {
     // --- Server certificates ---
     /// Server certificate chain (DER-encoded, leaf first).
     server_certificates: Vec<Vec<u8>>,
+    /// CertificateRequest context to echo in an empty client Certificate.
+    client_certificate_request_context: Option<Vec<u8>>,
 
     // --- ALPS ---
     /// Optional ALPS payload (pre-encoded H2 SETTINGS bytes from upper layer).
@@ -418,6 +423,7 @@ impl Tls13Handshake {
             client_hs_traffic_secret: None,
             server_hs_traffic_secret: None,
             server_certificates: Vec::new(),
+            client_certificate_request_context: None,
             alps_payload: None,
             server_alps_data: None,
             alps_code_point: None,
@@ -932,13 +938,16 @@ impl Tls13Handshake {
             }
             (Tls13State::WaitCertificate, handshake_type::CERTIFICATE_REQUEST) => {
                 // Server requests client authentication (RFC 8446 §4.3.2).
-                // We don't support client certificates, but must include the
-                // message in the transcript and continue waiting for Certificate.
+                // We don't support client certificates, so remember the request
+                // context and later send an empty Certificate message as required
+                // by RFC 8446 §4.4.2.
+                self.client_certificate_request_context =
+                    Some(parse_certificate_request_context(payload)?);
                 if let Some(ref mut transcript) = self.transcript {
                     transcript.update(full_msg);
                 }
                 tracing::debug!(
-                    "tls13.certificate_request_received — client certs not supported, skipping"
+                    "tls13.certificate_request_received — will send empty client certificate"
                 );
                 Ok(HandshakeAction::ContinueReading)
             }
@@ -1776,13 +1785,24 @@ impl Tls13Handshake {
             }
         }
 
+        // A client without a suitable certificate must still answer a
+        // handshake-time CertificateRequest with an empty Certificate message.
+        let client_certificate = self
+            .client_certificate_request_context
+            .as_deref()
+            .map(build_empty_client_certificate);
+        if let Some(ref certificate_msg) = client_certificate {
+            if let Some(ref mut transcript) = self.transcript {
+                transcript.update(certificate_msg);
+            }
+        }
+
         // --- Compute client Finished ---
         let client_hs_secret = self.client_hs_traffic_secret.as_ref().ok_or_else(|| {
             TlsError::HandshakeFailure("missing client_hs_traffic_secret".to_string())
         })?;
 
-        // Transcript for client Finished = CH..SF[..CEE]
-        // (includes Client EE if ALPS was negotiated)
+        // Transcript for client Finished = CH..SF[..CEE][..Certificate].
         let transcript_for_cf = self.transcript.as_ref().unwrap().current_hash();
         let client_verify_data =
             compute_finished_verify_data(hkdf_algo, client_hs_secret, &transcript_for_cf)?;
@@ -1806,8 +1826,9 @@ impl Tls13Handshake {
             master_secret.derive_secret("res master", &transcript_hash_ch_cf)?;
 
         self.state = Tls13State::Connected;
-        Ok(HandshakeAction::Complete(HandshakeComplete {
+        Ok(HandshakeAction::Complete(Box::new(HandshakeComplete {
             client_encrypted_extensions: client_ee,
+            client_certificate,
             client_finished,
             traffic_secrets: TrafficSecrets {
                 aead_algorithm: aead_algo,
@@ -1828,7 +1849,7 @@ impl Tls13Handshake {
             ech_accepted: self.ech_accepted,
             peer_quic_transport_params: self.peer_quic_transport_params.clone(),
             early_data_accepted: self.early_data_accepted,
-        }))
+        })))
     }
 
     // =======================================================================
@@ -2224,6 +2245,35 @@ fn decompress_certificate(
     }
 }
 
+/// Extract the request context from a TLS 1.3 CertificateRequest message.
+fn parse_certificate_request_context(payload: &[u8]) -> Result<Vec<u8>> {
+    let context_len = payload.first().copied().ok_or_else(|| {
+        TlsError::UnexpectedMessage("truncated TLS 1.3 CertificateRequest".to_string())
+    })? as usize;
+    let context_end = 1usize.checked_add(context_len).ok_or_else(|| {
+        TlsError::UnexpectedMessage("invalid TLS 1.3 CertificateRequest context".to_string())
+    })?;
+    if payload.len() < context_end {
+        return Err(TlsError::UnexpectedMessage(
+            "truncated TLS 1.3 CertificateRequest context".to_string(),
+        ));
+    }
+    Ok(payload[1..context_end].to_vec())
+}
+
+fn build_empty_client_certificate(request_context: &[u8]) -> Vec<u8> {
+    let body_len = 1 + request_context.len() + 3;
+    let mut message = Vec::with_capacity(4 + body_len);
+    message.push(handshake_type::CERTIFICATE);
+    message.push(((body_len as u32) >> 16) as u8);
+    message.push(((body_len as u32) >> 8) as u8);
+    message.push(body_len as u8);
+    message.push(request_context.len() as u8);
+    message.extend_from_slice(request_context);
+    message.extend_from_slice(&[0, 0, 0]);
+    message
+}
+
 /// Parse a TLS 1.3 Certificate handshake message.
 ///
 /// Returns a list of DER-encoded certificates (leaf first).
@@ -2298,6 +2348,25 @@ fn parse_certificate_message(payload: &[u8]) -> Result<Vec<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_client_certificate_echoes_request_context() {
+        assert_eq!(parse_certificate_request_context(&[0, 0, 0]).unwrap(), b"");
+        assert_eq!(
+            parse_certificate_request_context(&[3, 0xAA, 0xBB, 0xCC, 0, 0]).unwrap(),
+            [0xAA, 0xBB, 0xCC]
+        );
+        assert!(parse_certificate_request_context(&[2, 0xAA]).is_err());
+
+        assert_eq!(
+            build_empty_client_certificate(&[]),
+            [handshake_type::CERTIFICATE, 0, 0, 4, 0, 0, 0, 0]
+        );
+        assert_eq!(
+            build_empty_client_certificate(&[0xAA, 0xBB]),
+            [handshake_type::CERTIFICATE, 0, 0, 6, 2, 0xAA, 0xBB, 0, 0, 0,]
+        );
+    }
 
     fn build_hrr(session_id: &[u8], cipher_suite: u16, extensions: &[u8]) -> Vec<u8> {
         let mut body = Vec::new();

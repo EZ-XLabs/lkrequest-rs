@@ -84,6 +84,7 @@ impl QuicConstraints {
                 crate::profile::chrome_quic(),
                 crate::profile::chrome_146_quic(),
                 crate::profile::chrome_150_quic(),
+                crate::profile::chrome_151_quic(),
             ],
         }
     }
@@ -169,6 +170,7 @@ mod tests {
             ("chrome_quic", crate::profile::chrome_quic()),
             ("chrome_146_quic", crate::profile::chrome_146_quic()),
             ("chrome_150_quic", crate::profile::chrome_150_quic()),
+            ("chrome_151_quic", crate::profile::chrome_151_quic()),
         ]
     }
 

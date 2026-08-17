@@ -444,7 +444,7 @@ mod tests {
 
         let headers: Vec<(&str, &str)> = vec![
             (":method", "GET"),
-            (":authority", "example.com"),
+            (":authority", "tls.browserleaks.com"),
             (":scheme", "https"),
             (":path", "/"),
             ("cache-control", "max-age=0"),

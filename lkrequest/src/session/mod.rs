@@ -606,6 +606,13 @@ impl Session {
     ) {
         let session = self.clone();
         tokio::spawn(async move {
+            let permit = match session.reserve_connection() {
+                Ok(permit) => permit,
+                Err(error) => {
+                    tracing::debug!(host = %host, port, error = %error, "quic.background_probe_skipped");
+                    return;
+                }
+            };
             match session
                 .establish_h3_connection(
                     &host,
@@ -627,9 +634,8 @@ impl Session {
                         .alt_svc_cache()
                         .mark_h3_validated_for_route(&discovery.route, &discovery.origin);
                     let (sender, driver) = h3_conn.into_parts();
-                    let driver = std::sync::Arc::new(driver);
                     let mut pool = session.inner.pool.lock();
-                    pool.insert_h3(conn_key, sender, driver);
+                    pool.insert_h3_reserved(conn_key, sender, driver, permit);
                     tracing::debug!(host = %host, port, "quic.background_probe_succeeded");
                 }
                 Err(error) => {
@@ -1041,6 +1047,22 @@ impl Session {
         self.inner.pool.lock().stats()
     }
 
+    pub(crate) fn reserve_connection(
+        &self,
+    ) -> crate::error::Result<crate::connection_pool::ConnectionPermit> {
+        let mut pool = self.inner.pool.lock();
+        pool.try_reserve_connection().ok_or_else(|| {
+            crate::error::Error::Pool(format!(
+                "session connection limit reached ({} connections)",
+                pool.max_total,
+            ))
+        })
+    }
+
+    pub(crate) fn connection_budget(&self) -> crate::connection_pool::ConnectionBudget {
+        self.inner.pool.lock().connection_budget()
+    }
+
     /// Remove all connections from the pool, aborting their driver tasks.
     ///
     /// Subsequent requests will establish fresh connections.  This is
@@ -1149,6 +1171,7 @@ impl Session {
             client.tcp_fingerprint(),
             client.resolver(),
             tcp_timeout,
+            Some(self.connection_budget()),
             config,
         )
         .await?;
@@ -1732,6 +1755,7 @@ impl Session {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
     {
         Box::pin(async move {
+            let permit = self.reserve_connection()?;
             let h3_conn = match self
                 .establish_h3_connection(
                     host,
@@ -1761,9 +1785,8 @@ impl Session {
             self.alt_svc_cache()
                 .mark_h3_validated_for_route(&discovery.route, &discovery.origin);
             let (sender, driver) = h3_conn.into_parts();
-            let driver = std::sync::Arc::new(driver);
             let mut pool = self.inner.pool.lock();
-            pool.insert_h3(conn_key.clone(), sender, driver);
+            pool.insert_h3_reserved(conn_key.clone(), sender, driver, permit);
             Ok(())
         })
     }
@@ -1779,6 +1802,7 @@ impl Session {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = crate::error::Result<()>> + Send + 'a>>
     {
         Box::pin(async move {
+            let permit = self.reserve_connection()?;
             let client = &self.inner.client;
             let connect_config =
                 pipeline::build_connect_config(client, preferred_http_version, scheme);
@@ -1790,14 +1814,19 @@ impl Session {
             let use_h2 = pipeline::should_use_h2(conn.negotiated_alpn(), preferred_http_version)?;
 
             if use_h2 {
-                let h2_conn =
-                    crate::h2::connect_h2(conn.into_tcp_stream()?, client.h2_profile(), None)
-                        .await?;
+                let h2_conn = crate::h2::connect_h2_with_config(
+                    conn.into_tcp_stream()?,
+                    client.h2_profile(),
+                    None,
+                    client.max_pending_h2_requests(),
+                )
+                .await?;
                 let mut pool = self.inner.pool.lock();
-                pool.insert_h2(
+                pool.insert_h2_reserved(
                     conn_key.clone(),
                     h2_conn.clone_sender(),
                     h2_conn.into_task(),
+                    permit,
                 );
             } else {
                 let mut builder = hyper::client::conn::http1::Builder::new();
@@ -1820,7 +1849,7 @@ impl Session {
                     }
                 });
                 let mut pool = self.inner.pool.lock();
-                pool.insert_h1(conn_key.clone(), sender, conn_task);
+                pool.insert_h1_reserved(conn_key.clone(), sender, conn_task, permit);
             }
 
             Ok(())

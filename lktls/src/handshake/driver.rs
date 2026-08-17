@@ -569,7 +569,7 @@ impl HandshakeDriver {
                             self.state = DriverState::Tls13Encrypted { handshake };
                             continue;
                         }
-                        HandshakeAction::Complete(c) => return self.finish_tls13(c),
+                        HandshakeAction::Complete(c) => return self.finish_tls13(*c),
                         _ => {
                             return Err(TlsError::HandshakeFailure(
                                 "unexpected action during encrypted handshake".into(),
@@ -685,6 +685,13 @@ impl HandshakeDriver {
 
         if let Some(ref cee) = complete.client_encrypted_extensions {
             send_buf.extend_from_slice(&self.writer.write_record(content_type::HANDSHAKE, cee)?);
+        }
+        if let Some(ref certificate) = complete.client_certificate {
+            send_buf.extend_from_slice(
+                &self
+                    .writer
+                    .write_record(content_type::HANDSHAKE, certificate)?,
+            );
         }
         send_buf.extend_from_slice(
             &self
@@ -917,6 +924,10 @@ impl HandshakeDriver {
         client_random: [u8; 32],
         flight: crate::handshake::tls12::Tls12ClientFlight,
     ) -> Result<HandshakeOutput> {
+        let certificate = match flight.client_certificate.as_deref() {
+            Some(message) => self.writer.write_record(content_type::HANDSHAKE, message)?,
+            None => Vec::new(),
+        };
         let cke = self
             .writer
             .write_record(content_type::HANDSHAKE, &flight.client_key_exchange)?;
@@ -928,7 +939,9 @@ impl HandshakeDriver {
             .writer
             .write_record(content_type::HANDSHAKE, &flight.client_finished)?;
 
-        let mut send_buf = Vec::with_capacity(cke.len() + ccs.len() + fin.len());
+        let mut send_buf =
+            Vec::with_capacity(certificate.len() + cke.len() + ccs.len() + fin.len());
+        send_buf.extend_from_slice(&certificate);
         send_buf.extend_from_slice(&cke);
         send_buf.extend_from_slice(&ccs);
         send_buf.extend_from_slice(&fin);
@@ -1203,7 +1216,7 @@ impl QuicHandshakeDriver {
                             continue;
                         }
                         HandshakeAction::Complete(complete) => {
-                            return self.finish_quic_tls13(complete);
+                            return self.finish_quic_tls13(*complete);
                         }
                         _ => {
                             return Err(TlsError::HandshakeFailure(

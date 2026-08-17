@@ -1,605 +1,359 @@
 # lkrequest
 
-**A Rust HTTP client with byte-level TLS, HTTP/2 and HTTP/3 fingerprint control.**
+<p align="center">
+  <strong>Byte-level browser fingerprint control for Rust HTTP clients.</strong>
+</p>
 
-lkrequest enables precise simulation of real browser network fingerprints — including TLS ClientHello, HTTP/2 SETTINGS, QUIC Transport Parameters, and header order — making it suitable for web scraping, bot detection research, and browser emulation scenarios.
+<p align="center">
+  <a href="README-zh.md">简体中文</a> ·
+  <a href="CONTRIBUTING.md">Contributing</a> ·
+  <a href="SECURITY.md">Security</a> ·
+  <a href="LICENSE.txt">Apache-2.0</a>
+</p>
 
-## Features
+<p align="center">
+  <img alt="Version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-4c1.svg">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
+  <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
+  <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg">
+</p>
 
-- **TLS Fingerprint Control** — Byte-level ClientHello generation that matches real browsers (Chrome, Firefox, Safari)
-- **HTTP/2 Fingerprint Control** — SETTINGS frame order, pseudo-header order, WINDOW_UPDATE, PRIORITY frames, and per-request priority weights
-- **HTTP/3 + QUIC** — Optional `quic-h3` feature for full HTTP/3 over QUIC with fingerprint-aware Transport Parameters, Alt-Svc auto-discovery, and H2→H3 seamless upgrade
-- **Built-in Browser Presets** — Chrome 131/144/145/146/147/148/149/150, Firefox 133/147, Safari 18/26 (TLS + H2, plus QUIC when `quic-h3` is enabled)
-- **Fingerprint Randomization** — Optional `synthetic-fp` feature: per-session *synthetic* fingerprints (extension-order jitter, preset recombination, out-of-corpus perturbation), composable per layer via a `Layers` mask and held to a configurable negotiability floor
-- **Session Management** — Cookie jars, connection pooling, HTTP/2 multiplexing, and optional QUIC 0-RTT session resumption
-- **Connection Prewarming** — `session.preconnect()` pre-establishes DNS + TCP + TLS + H2 (or, with `quic-h3`, QUIC + H3) connections
-- **Custom DNS Resolver** — Pluggable DNS with DoH support, auto ECH config and H3 hints via HTTPS/SVCB records
-- **Alt-Svc Discovery** — Automatic HTTP/2 → HTTP/3 protocol upgrade via Alt-Svc headers with broken-QUIC fallback
-- **SessionPool** — High-concurrency pool with proxy rotation (round-robin / random)
-- **Proxy Support** — SOCKS5 and HTTP CONNECT with authentication, plus multi-hop **proxy chains** (QUIC/H3 supported over an all-SOCKS5 chain)
-- **WebSocket** — HTTP/1.1 Upgrade (RFC 6455) and H2 Extended CONNECT (RFC 8441)
-- **Middleware** — Interceptor chain for request/response modification
-- **Retry Policies** — Exponential backoff, fixed interval, custom strategies
-- **Redirect Control** — `RedirectPolicy::Follow(n)` or `RedirectPolicy::None` for manual handling
-- **Auto-Decompression** — Brotli, gzip, deflate, zstd
-- **Blocking API** — Synchronous wrapper for non-async contexts
-- **Multipart/Form-Data** — File uploads with streaming support
-- **TCP Fingerprint** — JA4T-style TCP SYN fingerprinting
 
-## Architecture
+`lkrequest` is a Rust HTTP client workspace for **wire-level control** of TLS, HTTP/2, and HTTP/3/QUIC fingerprints. It is built for browser-protocol research, interoperability testing, fingerprint verification, and controlled automation where ordinary high-level HTTP clients do not expose enough of the wire format.
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                lkrequest  (HTTP Client)                   │
-│                                                          │
-│   Client ──► Session ──► Request                         │
-│   (fingerprint    (virtual       (single                 │
-│    template)       browser        HTTP                   │
-│                    user)          call)                   │
-├────────────┬────────────┬────────────┬───────────────────┤
-│   lktls    │   lkh2     │   lkh3     │   lkquic          │
-│  (TLS FP   │  (H2 FP    │  (H3 FP    │  (QUIC endpoint   │
-│   engine)  │   engine)  │   config)  │   abstraction)    │
-├────────────┤            ├────────────┤                   │
-│ lktls-quic │            │ deps/h3    │   deps/quinn      │
-│ (QUIC-TLS  │            │ (patched)  │   (patched)       │
-│  bridge)   │            │            │                   │
-├────────────┴────────────┴────────────┴───────────────────┤
-│   Crypto Backend:  aws-lc-rs (TLS) + ring (QUIC)         │
-└──────────────────────────────────────────────────────────┘
-```
+The core invariant is simple: **a browser preset should match the target browser on the wire**. Changes that are abstractly valid but diverge from real browser output are treated as regressions.
 
-| Crate | Description |
-|-------|-------------|
-| **lkrequest** | High-level HTTP client — sessions, cookies, proxies, retry, WebSocket, H2/H3 dual dispatch |
-| **lkrequest-ffi** | Stable C ABI facade — sync/async requests, streaming, diagnostics, Session/Proxy pools |
-| **lktls** | Byte-level TLS fingerprint engine — ClientHello, handshake, record layer |
-| **lktls-quic** | Bridge between lktls and quinn for QUIC-native TLS 1.3 handshake |
-| **lkh2** | HTTP/2 fingerprint-controlled connections — SETTINGS, HEADERS, PRIORITY |
-| **lkh3** | HTTP/3 configuration and QUIC Transport Parameter fingerprinting |
-| **lkquic** | QUIC endpoint abstraction with pluggable backend (default: quinn) |
-| **lkprofile** | Profile parser — converts raw ClientHello / H2 / QUIC captures to profiles |
-| **tools/pcap_diff** | CLI tool for byte-level ClientHello comparison |
-| **tools/profile_collector** | CLI tool for extracting TLS + H2 + QUIC profiles from captures |
+> [!IMPORTANT]
+> This is a source-first workspace and currently depends on patched `quinn` and `h3` git submodules. Clone with submodules before building.
 
-## Prerequisites
+> [!WARNING]
+> Use this project only on systems and targets you are authorized to test. See [Security and responsible use](SECURITY.md).
 
-### Rust
+## Highlights
 
-Edition 2021+ (some crates use 2024). Async runtime: **Tokio**.
+- **TLS ClientHello control** — extension ordering, GREASE, cipher suites, signature algorithms, key shares, ECH, ALPS, certificate compression, and handshake behavior.
+- **Native HTTP/2 fingerprinting** — SETTINGS order, WINDOW_UPDATE, PRIORITY, pseudo-header order, HPACK behavior, and request priority.
+- **HTTP/3 and QUIC** — optional H3 stack with QUIC Transport Parameters, QPACK settings, PRIORITY_UPDATE, Alt-Svc discovery, session resumption, and SOCKS5 UDP support.
+- **Capture-backed browser presets** — Chrome 131 and 144–151, Firefox 133/147, and Safari 18/26.
+- **Browser-like sessions** — isolated cookie jars, physically bounded connection pools, H2 stream backpressure, redirects, retries, decompression, streaming, WebSocket, system-DNS singleflight with optional positive caching, and HSTS policies.
+- **Proxy orchestration** — HTTP CONNECT, SOCKS5, multi-hop proxy chains, resolved-address fallback, `ProxyPool`, and `SessionPool`.
+- **Stable C ABI** — `lkrequest-ffi` mirrors the Rust Client/Session/Request model for other languages.
+- **Offline regression gates** — serialized TLS/H2/QUIC fingerprints are checked against committed golden fixtures.
 
-### Git Submodules
+## Project Status
 
-This project uses patched forks of quinn and h3 as git submodules. You **must** initialize them before building:
-
-```bash
-git clone --recurse-submodules <repo-url>
-
-# Or if you already cloned without submodules:
-git submodule update --init
-```
-
-The submodules track the `lkrequest-patches` branch. To update to the latest patches:
-
-```bash
-git submodule update --remote
-```
-
-### Build Dependencies
-
-- **aws-lc-rs**: Uses prebuilt NASM binaries. On Windows this usually works out of the box.
-- **ring**: Required by quinn for QUIC crypto.
+- Current workspace release: **0.2.1**.
+- The public API is usable but still evolving before 1.0.
+- The repository is currently consumed **from source**; examples below use a local checkout.
+- HTTP/3, synthetic fingerprints, telemetry, and public-network tests are opt-in features.
+- Real-browser fidelity is version-, platform-, Finch-, GREASE-, and request-context-sensitive. Preset documentation distinguishes captured stable fields from variable behavior.
 
 ## Quick Start
 
-Add to your `Cargo.toml`:
+### 1. Clone and build
+
+Git submodules are mandatory because `deps/quinn` and `deps/h3` contain the patched transport behavior used by the workspace.
+
+```bash
+git clone --recurse-submodules <repository-url>
+cd lkrequest
+cargo test --workspace
+```
+
+If the repository was cloned without submodules:
+
+```bash
+git submodule update --init --recursive
+```
+
+Build requirements:
+
+- Rust toolchain with Cargo.
+- NASM, CMake, and libclang where required by the crypto toolchain.
+- `cbindgen` only when generating or changing the C header.
+
+### 2. Use the local crate
+
+From another Rust project:
 
 ```toml
 [dependencies]
-lkrequest = { path = "lkrequest" }
-lktls = { path = "lktls" }
-tokio = { version = "1", features = ["full"] }
+lkrequest = { path = "../lkrequest/lkrequest" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Enable HTTP/3 / QUIC explicitly when you need it:
+For HTTP/3:
 
 ```toml
-[dependencies]
-lkrequest = { path = "lkrequest", features = ["quic-h3"] }
+lkrequest = { path = "../lkrequest/lkrequest", features = ["quic-h3"] }
 ```
 
-### Zero-Config (Chrome 144 defaults)
+### 3. Send a request with an explicit browser preset
 
 ```rust
 use lkrequest::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::default();
-    let session = client.session().build();
-    let resp = session.get("https://httpbin.org/get").send().await?;
+    let client = Client::builder()
+        .preset(lkrequest::preset::chrome_151())
+        .build();
 
-    println!("Status: {}", resp.status());
-    println!("{}", resp.text()?);
+    // A Session represents one virtual browser user: cookies and connections
+    // are isolated from other sessions.
+    let session = client.session().build();
+    let response = session
+        .get("https://example.com/")
+        .send()
+        .await?;
+
+    println!("{}", response.status());
+    println!("{}", response.text()?);
     Ok(())
 }
 ```
 
-### Custom Fingerprint
+Run the repository example:
+
+```bash
+cargo run -p lkrequest --example basic_get
+```
+
+## HTTP/3 and QUIC
+
+Enable the `quic-h3` feature, then choose an explicit protocol policy:
 
 ```rust
 use lkrequest::Client;
-use lkrequest::h2::profile::chrome_146_h2;
-use lktls::profile::presets;
 
 let client = Client::builder()
-    .fingerprint(presets::chrome_146())
-    .h2_profile(chrome_146_h2())
-    .default_header(
-        "user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-         (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+    .preset(lkrequest::preset::chrome_151())
+    .build();
+
+// Prefer H3 and fall back to H2 when QUIC is unavailable.
+let session = client.session().http3_with_fallback().build();
+```
+
+Common modes:
+
+| Mode | API | Behavior |
+|---|---|---|
+| Browser-style | default preset policy | Uses discovery and per-origin QUIC failure tracking |
+| H3 only | `http3_only()` | No TCP fallback |
+| H3 with fallback | `http3_with_fallback()` | Prefer H3, fall back to H2 |
+| H2 only | `http2_only()` | Require HTTP/2 over TCP |
+
+```bash
+cargo run -p lkrequest --features quic-h3 --example basic_h3
+cargo run -p lkrequest --features quic-h3 --example h3_auto_discovery
+cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
+```
+
+## Browser Presets
+
+The high-level presets bundle TLS, H2, optional QUIC/H3, protocol policy, and header ordering:
+
+| Family | Presets |
+|---|---|
+| Chrome | `chrome_131`, `chrome_144`–`chrome_151` |
+| Firefox | `firefox_133`, `firefox_147` |
+| Safari | `safari_18`, `safari_26` |
+
+Use explicit versions for reproducible behavior:
+
+```rust
+let client = lkrequest::Client::builder()
+    .preset(lkrequest::preset::chrome_151())
+    .build();
+```
+
+Chrome 151 is capture-verified on Windows. Its TCP TLS/H2 stable fields match Chrome 150, while real public-site QUIC captures use the classic QUIC signature-algorithm list plus `rsa_pkcs1_sha1` without the three TCP ML-DSA entries.
+
+## Capability Matrix
+
+| Capability | Default | Feature / crate |
+|---|---:|---|
+| HTTP/1.1 | Yes | `lkrequest` |
+| Native fingerprintable HTTP/2 | Yes | `h2-native` |
+| HTTP/3 + QUIC | No | `quic-h3` |
+| Public-network E2E helpers | No | `network-e2e` |
+| Synthetic fingerprint generation | No | `synthetic-fp` |
+| Operational telemetry | No | `telemetry` |
+| C ABI | Separate crate | `lkrequest-ffi` |
+
+Synthetic modes intentionally produce fingerprints that do not correspond to a captured browser. They are not substitutes for browser presets and should not be used where allowlist identity is expected.
+
+TLS 1.2 and TLS 1.3 servers that request, but do not require, a client certificate are supported: `lkrequest` sends an empty client `Certificate` with the correct handshake context. Configuring an explicit client identity for mutual TLS is not yet part of the public API.
+
+## Proxy, DNS, and Session Pools
+
+Supported proxy paths:
+
+- HTTP CONNECT and SOCKS5 for TCP protocols.
+- SOCKS5 UDP for QUIC/H3.
+- Multi-hop proxy chains; QUIC chains require every hop to support SOCKS5 UDP.
+- Direct TCP and SOCKS5 connection setup try resolved addresses in resolver order, so one unreachable IPv4 or IPv6 candidate does not abort the route.
+- `ProxyPool` for proxy allocation and concurrency control.
+- `SessionPool` for reusable virtual-browser sessions.
+### System DNS concurrency and caching
+
+The default `SystemDns` resolver delegates to the operating system and automatically coalesces simultaneous lookups for the same `(host, port)` across the process. This prevents a burst of sessions from issuing duplicate `getaddrinfo` calls. Successes and errors are shared by current waiters, cancellation of one waiter does not cancel the shared lookup, and completed results are not cached by default.
+
+Enable a short-lived positive cache when the same hosts are requested repeatedly after the original lookup has completed:
+
+```rust
+use std::time::Duration;
+use lkrequest::{Client, SystemDnsCacheConfig};
+
+let client = Client::builder()
+    .system_dns_cache(
+        SystemDnsCacheConfig::positive(Duration::from_secs(30))
+            .with_max_entries(4096),
     )
     .build();
-
-let session = client.session().build();
-let resp = session.get("https://example.com/json").send().await?;
 ```
 
-### Using a Preset (TLS + H2 + optional QUIC + Header Order bundled)
+The cache belongs to that resolver instance, stores only successful non-empty address lists, and never caches errors. A zero TTL or zero capacity disables completed-result caching while retaining in-flight coalescing. Resolver configuration methods replace each other, so the last call to `.dns()`, `.dns_resolver()`, or `.system_dns_cache()` wins. Use `DnsConfig` or a custom `DnsResolver` instead when custom name servers, DoH/DoT, HTTPS/SVCB records, or ECH discovery are required.
 
-```rust
-use lkrequest::{preset, Client};
+Typical choices:
 
-let client = Client::builder()
-    .preset(preset::chrome_146())
-    .build();
-```
+- **Concurrent bursts to the same origin:** use the default configuration; singleflight is automatic.
+- **Repeated short-interval requests:** enable a positive cache with a bounded TTL and capacity.
+- **Authoritative DNS freshness or custom DNS transports:** keep caching disabled or configure a custom resolver.
 
-### POST with JSON
+### Connection pool limits and the 0.2.1 migration
 
-```rust
-use serde::Serialize;
+Connection limits count physical H1/H2/H3 connections rather than multiplexed requests. Native H2 honors the peer's concurrent-stream limit and applies backpressure while capacity is exhausted instead of silently falling back to H1 or opening unbounded connections. Stale pooled H1 connections encountered during redirect handling are evicted and reconnected through the normal retry policy.
 
-#[derive(Serialize)]
-struct Payload {
-    name: String,
-    email: String,
-}
-
-let resp = session
-    .post("https://httpbin.org/post")
-    .json(&Payload {
-        name: "Alice".into(),
-        email: "alice@example.com".into(),
-    })?
-    .send()
-    .await?;
-```
-
-### Custom Headers & Cookie Persistence
-
-```rust
-let client = Client::builder()
-    .fingerprint(presets::chrome_146())
-    .h2_profile(chrome_146_h2())
-    .default_header("accept-language", "en-US,en;q=0.9")
-    .build();
-
-let session = client.session().build();
-
-// Per-request headers
-let resp = session
-    .get("https://httpbin.org/headers")
-    .header("x-custom-id", "12345")
-    .send()
-    .await?;
-
-// Cookies are automatically persisted within the same session
-session.get("https://httpbin.org/cookies/set/token/abc").send().await?;
-let resp = session.get("https://httpbin.org/cookies").send().await?;
-// → cookies: { "token": "abc" }
-```
-
-## HTTP/3 & QUIC
-
-HTTP/3 support is behind the `quic-h3` feature and is disabled by default.
-
-Enable it in your dependency declaration first:
-
-```toml
-lkrequest = { path = "lkrequest", features = ["quic-h3"] }
-```
-
-With that feature enabled, the client can operate in several modes:
-
-### Automatic H3 (via Alt-Svc Discovery)
-
-```rust
-let client = Client::builder()
-    .preset(preset::chrome_146())
-    .build();
-
-let session = client.session().build();
-
-// First request goes over H2; server responds with Alt-Svc: h3=":443"
-// Subsequent requests automatically upgrade to H3
-let resp = session.get("https://example.com").send().await?;
-println!("Protocol: {:?}", resp.version()); // HTTP/2 or HTTP/3
-```
-
-### Force HTTP/3 Only
-
-```rust
-let session = client.session()
-    .http3_only()
-    .build();
-
-let resp = session.get("https://example.com").send().await?;
-// Always uses QUIC + HTTP/3; fails if server doesn't support it
-```
-
-### H3 with H2 Fallback
-
-```rust
-let session = client.session()
-    .http3_with_fallback()
-    .build();
-
-// Tries H3 first, falls back to H2 if QUIC fails
-let resp = session.get("https://example.com").send().await?;
-```
-
-### Disable HTTP/3
-
-```rust
-let client = Client::builder()
-    .fingerprint(presets::chrome_146())
-    .disable_http3()
-    .build();
-```
-
-### DNS-Driven H3 Discovery
-
-When using DoH, HTTPS/SVCB DNS records can provide H3 hints (ALPN `h3`) and ECH configs before connecting:
-
-```rust
-use lkrequest::{Client, DnsConfig};
-
-let client = Client::builder()
-    .dns(DnsConfig::CloudflareHttps)
-    .preset(preset::chrome_146())
-    .build();
-
-// DNS HTTPS record → ECH config + h3 ALPN hint → direct H3 connection
-let session = client.session().build();
-let resp = session.get("https://cloudflare.com").send().await?;
-```
-
-### QUIC Session Resumption (0-RTT)
-
-```rust
-let session = client.session().build();
-
-// First connection: full QUIC handshake
-session.get("https://example.com").send().await?;
-
-// Second connection: 0-RTT resumption (if server supports it)
-session.get("https://example.com/page2").send().await?;
-```
-
-## Proxy
-
-### Single Proxy
-
-```rust
-use lkrequest::proxy::ProxyConfig;
-
-let session = client.session()
-    .proxy(ProxyConfig::parse("socks5://user:pass@proxy:1080")?)
-    .build();
-```
-
-### Proxy Chain (multi-hop)
-
-Route through an ordered chain of proxies (client → hop1 → hop2 → … → target).
-TCP (HTTP/1.1, HTTP/2) works with any mix of HTTP CONNECT and SOCKS5 hops.
-**QUIC/HTTP/3** works over an **all-SOCKS5** chain (nested UDP ASSOCIATE); a chain
-containing an HTTP hop errors for QUIC, so the request falls back to H2.
-
-```rust
-use lkrequest::proxy::ProxyConfig;
-
-// client → hop1 → hop2 → target
-let chain = ProxyConfig::parse_chain([
-    "socks5://user:pass@hop1:1080",
-    "socks5://user:pass@hop2:1080",
-])?;
-
-let session = client.session()
-    .proxy_config(chain)
-    .build();
-```
-
-### SessionPool with Proxy Rotation
+Configure and observe pooling through `Session` for new code:
 
 ```rust
 use std::time::Duration;
-use lkrequest::{Client, SessionPool};
-use lkrequest::proxy::ProxyConfig;
+use lkrequest::Client;
 
-let pool = SessionPool::builder()
-    .client(&client)
-    .proxies(vec![
-        ProxyConfig::parse("socks5://user:pass@proxy1:1080")?,
-        ProxyConfig::parse("http://user:pass@proxy2:8080")?,
-    ])
-    .max_sessions(100)
-    .idle_timeout(Duration::from_secs(300))
+let client = Client::builder().build();
+let session = client
+    .session()
+    .max_connections(32)
+    .idle_timeout(Duration::from_secs(90))
     .build();
 
-let guard = pool.acquire().await;
-let resp = guard.get("https://httpbin.org/ip").send().await?;
-// guard dropped → session returns to pool
+let stats = session.pool_stats();
+println!("physical connections: {}/{}", stats.total, stats.max_total);
 ```
 
-### Dynamic Proxy Provider
+The low-level `ConnectionPool` acquisition and mutation methods published in 0.2.0 remain source-compatible in 0.2.1, but are marked deprecated so IDEs highlight migration work. Existing callers can upgrade without an immediate rewrite; new integrations should use Session-managed pooling. These compatibility wrappers are planned for removal in 0.3.0.
 
-```rust
-let client = Client::builder()
-    .preset(preset::chrome_146())
-    .build();
+Useful examples:
 
-let pool = SessionPool::builder()
-    .client(&client)
-    .proxy_fn(|| async {
-        // Return a fresh proxy from your provider on each call
-        Ok(ProxyConfig::parse("http://rotating-proxy.example.com:8080")?)
-    })
-    .build();
+```bash
+cargo run -p lkrequest --example proxy_pool
+cargo run -p lkrequest --example session_pool
+cargo run -p lkrequest --example proxy_dynamic
+cargo run -p lkrequest --features quic-h3 --example h3_socks5_force
+cargo run -p lkrequest --example dns_proxy_probe
 ```
 
-## DNS Configuration
+## Architecture
 
-```rust
-use lkrequest::{Client, DnsConfig};
-
-// Preset resolvers
-let client = Client::builder().dns(DnsConfig::System).build();          // OS default
-let client = Client::builder().dns(DnsConfig::GoogleHttps).build();     // Google DoH
-let client = Client::builder().dns(DnsConfig::CloudflareHttps).build(); // Cloudflare DoH
-let client = Client::builder().dns(DnsConfig::Quad9Https).build();      // Quad9 DoH
-
-// DoH resolvers also fetch HTTPS/SVCB records for:
-// - ECH (Encrypted Client Hello) config auto-discovery
-// - H3 ALPN hints for direct QUIC connections
+```text
+lkrequest-ffi
+      │
+      ▼
+lkrequest ───────────── high-level Client / Session / Request API
+  │       │       │
+  ▼       ▼       ▼
+lktls    lkh2    lkh3 + lkquic
+  │                 │
+  ▼                 ▼
+lktls-quic       patched h3 / quinn submodules
 ```
 
-## Connection Prewarming
+| Component | Responsibility |
+|---|---|
+| `lkrequest` | Sessions, requests, cookies, pools, proxies, DNS, retries, redirects, streaming |
+| `lktls` | Sans-I/O TLS engine and byte-level ClientHello profiles |
+| `lkh2` | Native H2 codec, HPACK, SETTINGS, priority, and header ordering |
+| `lkh3` | HTTP/3/QPACK profiles and H3 request behavior |
+| `lkquic` | QUIC endpoint and backend integration |
+| `lktls-quic` | TLS 1.3 bridge for QUIC |
+| `lkprofile` | Fingerprint parsing and normalization |
+| `lkrequest-ffi` | Stable C ABI and generated C header |
+| `tools/profile_collector` | Browser/profile capture and preset export |
+| `tools/pcap_diff` | Byte-level capture comparison |
+| `tools/fpverify` | Canonical fingerprint verification |
 
-```rust
-let session = client.session().build();
+## Fingerprint Methodology
 
-// Pre-establish connection (DNS + TCP + TLS + H2 SETTINGS, or DNS + QUIC + H3)
-session.preconnect("https://api.example.com").await?;
+Profiles are **capture-first**:
 
-// Subsequent request reuses the pre-warmed connection
-let resp = session.get("https://api.example.com/data").send().await?;
+1. Capture a real browser with `tools/profile_collector`, Wireshark/tshark, or a controlled local endpoint.
+2. Separate stable fields from per-connection and request-context variables.
+3. Model the fingerprint at the highest layer that can express it.
+4. Serialize through the real TLS/H2/H3 implementation.
+5. Compare against normalized captures and committed golden files.
 
-// Batch preconnect multiple origins concurrently
-session.preconnect_many(&[
-    "https://api.example.com",
-    "https://cdn.example.com",
-]).await;
+Do not hand-edit `lktls/profiles/*.json` merely to satisfy a failing test. Recapture the browser when the target version changes.
+
+## Testing
+
+Default CI is offline and deterministic:
+
+```bash
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-## Retry & Redirect
+QUIC/H3:
 
-### Retry Policies
-
-```rust
-use lkrequest::retry::{RetryPolicy, ExponentialBackoff, FixedInterval};
-
-let session = client.session()
-    .retry_policy(ExponentialBackoff::new(3))  // 3 retries with exponential backoff
-    .build();
-
-// Or fixed interval
-let session = client.session()
-    .retry_policy(FixedInterval::new(3, Duration::from_secs(1)))
-    .build();
+```bash
+cargo test -p lkrequest --features quic-h3
 ```
 
-### Redirect Control
+Public-network tests are ignored by default. Run them only with explicit authorization:
 
-```rust
-use lkrequest::RedirectPolicy;
-
-// Auto-follow up to 10 redirects (default)
-let session = client.session().build();
-
-// Disable auto-redirect
-let session = client.session()
-    .redirect_policy(RedirectPolicy::None)
-    .build();
-
-// Custom limit
-let session = client.session()
-    .max_redirects(5)
-    .build();
+```bash
+TEST_ALLOW_NETWORK=1 cargo test --workspace -- --include-ignored
 ```
 
-## WebSocket
+See [docs/TESTING.md](docs/TESTING.md) for test tiers and environment requirements.
 
-```rust
-let session = client.session().build();
+## C ABI
 
-// HTTP/1.1 Upgrade or H2 Extended CONNECT (automatic based on connection)
-let ws = session.websocket("wss://echo.websocket.org")
-    .header("Origin", "https://example.com")
-    .connect()
-    .await?;
-```
-
-## Timeout Configuration
-
-```rust
-use std::time::Duration;
-
-let client = Client::builder()
-    .dns_timeout(Duration::from_secs(5))
-    .tcp_connect_timeout(Duration::from_secs(10))
-    .tls_handshake_timeout(Duration::from_secs(10))
-    .ttfb_timeout(Duration::from_secs(30))
-    .total_timeout(Duration::from_secs(60))
-    .build();
-```
-
-## Fingerprint Verification
-
-```rust
-// Verify TLS + H2 fingerprint
-let resp = session.get("https://example.com/json").send().await?;
-let json: serde_json::Value = resp.json()?;
-println!("JA3:    {}", json["ja3_hash"]);
-println!("JA4:    {}", json["ja4"]);
-println!("Akamai: {}", json["akamai_hash"]);
-
-// Verify H3/QUIC fingerprint
-let h3_session = client.session().http3_only().build();
-let resp = h3_session.get("https://quic.browserleaks.com/json").send().await?;
-```
-
-## Built-in Fingerprint Profiles
-
-### TLS Profiles
-
-| Profile | JA3 Hash | Browser |
-|---------|----------|---------|
-| `chrome_131()` | — | Chrome 131 (Windows) |
-| `chrome_144()` | `991d71ee69967b7325077b71bad10393` | Chrome 144 (Windows) |
-| `chrome_145()` | — | Chrome 145 (Windows) |
-| `chrome_146()` | `991d71ee69967b7325077b71bad10393` | Chrome 146 (Windows) |
-| `chrome_147()` | — | Chrome 147 (Windows) |
-| `chrome_148()` | — | Chrome 148 (Windows) |
-| `chrome_149()` | — | Chrome 149 (Windows) |
-| `chrome_150()` | — | Chrome 150 (Windows) |
-| `firefox_133()` | — | Firefox 133 |
-| `firefox_147()` | — | Firefox 147 |
-| `safari_18()` | — | Safari 18 (macOS) |
-| `safari_26()` | — | Safari 26 (macOS) |
-
-> **Chrome 150** matches Chrome 149 on the wire **except** for one change captured on the TLS/H2 (TCP) ClientHello: it prepends three ML-DSA post-quantum signature code-points (`0x0904`/`0x0905`/`0x0906` = `mldsa44`/`65`/`87`) to `signature_algorithms`. This shifts **JA4** but not **JA3** (JA3 excludes signature algorithms), and requires no PQC crypto since the codepoints are only advertised, never negotiated by real servers.
->
-> **HTTP/3 is not updated for Chrome 150.** `preset::chrome_150()` still reuses the shared Chrome 146 QUIC/H3 transport profile (as Chrome 144–149 do), so its QUIC ClientHello does **not** yet carry the ML-DSA signature algorithms. A dedicated Chrome 150 H3 capture is pending — the local capture path is blocked by Chrome's QUIC certificate enforcement.
-
-### Client Presets (TLS + H2 + optional QUIC + Header/Cookie Order)
-
-| Preset | Includes |
-|--------|----------|
-| `preset::chrome_146()` | TLS + H2 + optional QUIC profile + header order + cookie order |
-| `preset::chrome_147()` | TLS + H2 + optional QUIC profile + header order + cookie order |
-| (more) | See `lkrequest/src/preset.rs` |
-
-Profiles are defined as JSON files in `lktls/profiles/` and can be extended with custom profiles captured via the `profile_collector` tool.
-
-## TLS Capabilities
-
-- TLS 1.2 & TLS 1.3 handshake (including static RSA key exchange suites)
-- Extension order control (critical for fingerprint matching)
-- GREASE support (cipher suites, extensions, named groups)
-- ECH (Encrypted Client Hello) support with auto-discovery via DNS
-- Session resumption (PSK / Session Tickets)
-- ALPS (Application-Layer Protocol Settings)
-- Certificate compression (Brotli)
-- Crypto backend: `aws-lc-rs` (supports ML-KEM-768 post-quantum, TLS 1.2 CBC)
-- Certificate verification with custom CA roots
-
-## HTTP/2 Capabilities
-
-- SETTINGS frame parameter order control
-- Pseudo-header order (`:method`, `:authority`, `:scheme`, `:path`)
-- Connection-level WINDOW_UPDATE
-- HEADERS stream dependency with configurable policy (Flat / Chain)
-- Standalone PRIORITY frames
-- Per-request priority with browser-aware urgency-to-weight mapping (RFC 9218)
-
-## HTTP/3 & QUIC Capabilities
-
-- Full QUIC transport over UDP via patched quinn
-- QUIC Transport Parameter fingerprinting (initial_max_data, max_streams, etc.)
-- Alt-Svc header parsing for automatic H2→H3 upgrade
-- HTTPS/SVCB DNS record resolution for H3 discovery
-- QUIC session resumption and 0-RTT
-- Broken-QUIC tracking with automatic fallback to H2
-- H3-specific header order control
-
-## FFI (C ABI)
-
-`lkrequest-ffi` provides a stable C ABI for non-Rust consumers.
-
-Exported object model:
-- `Client` / `Session` / `Request` / `Response` / `StreamingResponse` / `Error` / `Op`
-- `ProxyPool` / `ProxyPoolBuilder` / `ProxyGuard`
-- `SessionPool` / `SessionPoolBuilder` / `SessionPoolGuard`
-- `Multipart`
-
-FFI coverage includes:
-- Sync + async request execution with H1/H2/H3 protocol selection
-- Streaming reads with diagnostics and header lookups
-- Session cookie CRUD, preconnect, connection-pool stats
-- ProxyPool / SessionPool acquire, bad-marking
-- Multipart/form-data request bodies
-- DNS preset/custom configuration and native cert toggle
-- File logger and callback logger sinks
-
-The public C header is generated at build time by `build.rs` (via cbindgen) at `lkrequest-ffi/include/lkrequest.h`; it is not committed to the repository.
+`lkrequest-ffi` exposes opaque handles for Client, Session, Request, Response, streaming, proxy/session pools, multipart bodies, errors, and async operations.
 
 ```bash
 cargo test -p lkrequest-ffi
+cargo clippy -p lkrequest-ffi --all-targets --all-features -- -D warnings
 ```
 
-## Examples
+The public header is generated from the Rust exports:
 
 ```bash
-# Basic usage
-cargo run -p lkrequest --example basic_get
-cargo run -p lkrequest --example post_json
-cargo run -p lkrequest --example custom_headers
-
-# Fingerprint verification
-cargo run -p lkrequest --example fingerprint_check
-cargo run -p lkrequest --example fingerprint_check_146
-cargo run -p lkrequest --example fingerprint_compare
-
-# HTTP/3 & QUIC
-cargo run -p lkrequest --features quic-h3 --example basic_h3
-cargo run -p lkrequest --features quic-h3 --example h3_vs_h2
-cargo run -p lkrequest --features quic-h3 --example h3_auto_discovery
-cargo run -p lkrequest --features quic-h3 --example h3_fingerprint_check
-cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
-cargo run -p lkrequest --features quic-h3 --example h3_dns_to_response
-cargo run -p lkrequest --features quic-h3 --example fingerprint_compare_quic
-
-# Proxy & pool
-cargo run -p lkrequest --example session_pool
-cargo run -p lkrequest --example proxy_pool
-
-# Header ordering
-cargo run -p lkrequest --example header_order_test
-
-# ECH
-cargo run -p lkrequest --example ech_test
+cd lkrequest-ffi
+cbindgen . --config cbindgen.toml > include/lkrequest.h
 ```
 
-## Cargo Features
+See [lkrequest-ffi/README.md](lkrequest-ffi/README.md) for ownership, threading, and ABI rules.
 
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `h2-native` | Yes | Use lkh2's native HPACK encoder for full H2 fingerprint control |
-| `quic-h3` | No | Enable QUIC / HTTP/3 support, QUIC-aware presets, and H3 examples/tests |
-| `network-e2e` | No | Enable public-network integration tests (not run in default CI) |
+## Documentation and Examples
+
+- [Testing guide](docs/TESTING.md)
+- [Contributing guide](CONTRIBUTING.md)
+- [Security and responsible use](SECURITY.md)
+- [FFI guide](lkrequest-ffi/README.md)
+- [Rust examples](lkrequest/examples)
+- [Fingerprint regression design](docs/fingerprint-regression-design.md)
+- [QUIC/H3 fingerprint notes](docs/chrome146-quic-h3-fingerprint.md)
+
+## Contributing
+
+Contributions are welcome. Fingerprint changes must include evidence showing how the new output relates to a real browser capture. Keep source changes, golden updates, tests, and empirical claims clearly separated.
+
+Before opening a pull request, read [CONTRIBUTING.md](CONTRIBUTING.md) and run the relevant offline gates.
 
 ## License
 
-Apache License 2.0 — Copyright 2026 EZXLabs
+Licensed under the [Apache License 2.0](LICENSE.txt).

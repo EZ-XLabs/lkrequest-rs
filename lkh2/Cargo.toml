@@ -1,6 +1,6 @@
 [package]
 name = "lkh2"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "HTTP/2 fingerprint-controlled connection library"
 
@@ -23,6 +23,7 @@ rand_core = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 fluke-hpack = "0.3"
+h2 = { workspace = true }
 lktls = { path = "../lktls" }
 tokio = { workspace = true, features = ["full"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

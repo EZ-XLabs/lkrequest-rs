@@ -644,6 +644,15 @@ pub fn chrome_150_h2() -> H2Profile {
     chrome_144_h2()
 }
 
+/// Returns the Chrome 151 H2 fingerprint profile.
+///
+/// Verified identical to Chrome 150 by capturing real Chrome 151.0.7922.72.
+/// Akamai fingerprint: `1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p`
+/// Akamai hash: `52d84b11737d980aef856699f885ca86`
+pub fn chrome_151_h2() -> H2Profile {
+    chrome_150_h2()
+}
+
 /// Returns the Chrome 131 H2 fingerprint profile.
 ///
 /// Same H2 parameters as Chrome 144 (H2 fingerprint hasn't changed).
@@ -1077,6 +1086,13 @@ pub fn chrome_149_header_order() -> Vec<String> {
 /// Same as Chrome 149 (verified unchanged vs the Chrome 150 capture).
 pub fn chrome_150_header_order() -> Vec<String> {
     chrome_144_header_order()
+}
+
+/// Returns the Chrome 151 HTTP header sending order.
+///
+/// Same as Chrome 150 (verified unchanged vs the Chrome 151 capture).
+pub fn chrome_151_header_order() -> Vec<String> {
+    chrome_150_header_order()
 }
 
 /// Returns the Chrome 131 HTTP header sending order.

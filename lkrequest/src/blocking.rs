@@ -204,6 +204,18 @@ impl ClientBuilder {
         self
     }
 
+    /// Bound HTTP/2 requests waiting for remote stream capacity.
+    pub fn max_pending_h2_requests(mut self, max: usize) -> Self {
+        self.inner = self.inner.max_pending_h2_requests(max);
+        self
+    }
+
+    /// Restore the default unbounded HTTP/2 pending-request queue.
+    pub fn unbounded_pending_h2_requests(mut self) -> Self {
+        self.inner = self.inner.unbounded_pending_h2_requests();
+        self
+    }
+
     /// Add a default header that will be included in every request.
     pub fn default_header(mut self, name: &str, value: &str) -> Self {
         self.inner = self.inner.default_header(name, value);

@@ -17,7 +17,7 @@ use crate::alt_svc::{
     Scheme as OriginScheme,
 };
 use crate::client::Client;
-use crate::connection_pool::{ConnectionKey, PooledConnection, Scheme};
+use crate::connection_pool::{AcquiredConnection, ConnectionKey, ConnectionPermit, Scheme};
 use crate::dns::HttpsRecord;
 use crate::error::{Error, Result};
 #[cfg(any(feature = "quic-h3", test))]
@@ -217,6 +217,11 @@ pub(crate) fn decide_protocol(
         HttpIntent::H2Only => ProtocolDecision::Tcp,
         HttpIntent::H3Only => ProtocolDecision::Quic,
     }
+}
+
+#[cfg(feature = "quic-h3")]
+pub(crate) fn is_connection_limit_error(error: &Error) -> bool {
+    matches!(error, Error::Pool(message) if message.starts_with("session connection limit reached"))
 }
 
 #[cfg(feature = "quic-h3")]
@@ -516,16 +521,24 @@ pub(crate) async fn establish_h2_and_pool(
     client: &Client,
     session: &Session,
     conn_key: &ConnectionKey,
+    permit: ConnectionPermit,
 ) -> Result<lkh2::H2ReadySender> {
-    let h2_conn = crate::h2::connect_h2(stream, client.h2_profile(), None).await?;
+    let h2_conn = crate::h2::connect_h2_with_config(
+        stream,
+        client.h2_profile(),
+        None,
+        client.max_pending_h2_requests(),
+    )
+    .await?;
     let sender = h2_conn.clone_sender();
 
     {
         let mut pool = session.inner.pool.lock();
-        pool.insert_h2(
+        pool.insert_h2_reserved(
             conn_key.clone(),
             h2_conn.clone_sender(),
             h2_conn.into_task(),
+            permit,
         );
     }
 
@@ -549,9 +562,15 @@ pub(crate) async fn establish_h2_with_first_request(
     session: &Session,
     conn_key: &ConnectionKey,
     first_request: http::Request<Option<bytes::Bytes>>,
+    permit: ConnectionPermit,
 ) -> Result<(lkh2::driver::FirstRequestResponse, lkh2::H2ReadySender)> {
-    let mut h2_conn =
-        crate::h2::connect_h2(stream, client.h2_profile(), Some(first_request)).await?;
+    let mut h2_conn = crate::h2::connect_h2_with_config(
+        stream,
+        client.h2_profile(),
+        Some(first_request),
+        client.max_pending_h2_requests(),
+    )
+    .await?;
 
     let first_resp = h2_conn
         .take_first_response()
@@ -561,10 +580,11 @@ pub(crate) async fn establish_h2_with_first_request(
 
     {
         let mut pool = session.inner.pool.lock();
-        pool.insert_h2(
+        pool.insert_h2_reserved(
             conn_key.clone(),
             h2_conn.clone_sender(),
             h2_conn.into_task(),
+            permit,
         );
     }
 
@@ -748,14 +768,14 @@ pub(crate) fn try_acquire_pooled(
     session: &Session,
     conn_key: &ConnectionKey,
     http_version: PreferredHttpVersion,
-) -> Option<PooledConnection> {
+) -> Option<AcquiredConnection> {
     let mut pool = session.inner.pool.lock();
     match http_version {
-        PreferredHttpVersion::Auto => pool.try_acquire(conn_key),
-        PreferredHttpVersion::Http1Only => pool.try_acquire_h1_pooled(conn_key),
-        PreferredHttpVersion::Http2Only => pool.try_acquire_h2_pooled(conn_key),
+        PreferredHttpVersion::Auto => pool.try_acquire_internal(conn_key),
+        PreferredHttpVersion::Http1Only => pool.try_acquire_h1_pooled_internal(conn_key),
+        PreferredHttpVersion::Http2Only => pool.try_acquire_h2_pooled_internal(conn_key),
         PreferredHttpVersion::Http3Only | PreferredHttpVersion::Http3WithFallback => {
-            pool.try_acquire_h3_pooled(conn_key)
+            pool.try_acquire_h3_pooled_internal(conn_key)
         }
     }
 }

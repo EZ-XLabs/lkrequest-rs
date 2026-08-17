@@ -6,7 +6,7 @@ use tracing::Instrument;
 use url::Url;
 
 use crate::client::Client;
-use crate::connection_pool::{ConnectionKey, PooledConnection, Scheme};
+use crate::connection_pool::{AcquiredConnection, ConnectionKey, ConnectionPermit, Scheme};
 use crate::error::{ConnectionPhase, Error, Result};
 use crate::proxy::ProxyConfig;
 use crate::response::{HttpVersion, RedirectRecord, Response};
@@ -325,7 +325,7 @@ impl RequestBuilder {
 
             match pooled {
                 #[cfg(feature = "quic-h3")]
-                Some(PooledConnection::H3(mut cached_sender)) => {
+                Some(AcquiredConnection::H3(mut cached_sender)) => {
                     tracing::debug!(host = %target.host, port = target.port, protocol = "h3", pooled = true, "connection.acquired");
                     let result = self
                         .send_h3_request(&mut cached_sender, &ctx, body.clone())
@@ -355,7 +355,7 @@ impl RequestBuilder {
                         other => other,
                     }
                 }
-                Some(PooledConnection::H2(cached_sender)) => match cached_sender.ready().await {
+                Some(AcquiredConnection::H2(cached_sender)) => match cached_sender.ready().await {
                     Ok(sender) => {
                         tracing::debug!(host = %target.host, port = target.port, protocol = "h2", pooled = true, "connection.acquired");
                         let result = self.send_h2_request(sender, &ctx, body.clone()).await;
@@ -393,14 +393,15 @@ impl RequestBuilder {
                         self.establish_and_send(&ctx, body).await
                     }
                 },
-                Some(PooledConnection::H1 {
+                Some(AcquiredConnection::H1 {
                     mut sender,
                     conn_task,
+                    permit,
                 }) => match sender.ready().await {
                     Ok(()) => {
                         tracing::debug!(host = %target.host, port = target.port, protocol = "h1.1", pooled = true, "connection.acquired");
                         let result = self
-                            .send_h1_request(sender, conn_task, &ctx, body.clone())
+                            .send_h1_request(sender, conn_task, permit, &ctx, body.clone())
                             .await;
 
                         match result {
@@ -425,6 +426,8 @@ impl RequestBuilder {
                     }
                     Err(e) => {
                         tracing::debug!(host = %target.host, error = %e, "connection.h1_stale_evicted");
+                        conn_task.abort();
+                        drop(permit);
                         self.establish_and_send(&ctx, body).await
                     }
                 },
@@ -471,16 +474,6 @@ impl RequestBuilder {
         Box::pin(
             async move {
                 let connect_start = std::time::Instant::now();
-
-                {
-                    let pool = self.session.inner.pool.lock();
-                    if pool.is_at_capacity() {
-                        return Err(Error::Pool(format!(
-                            "session connection limit reached ({} connections)",
-                            pool.max_total,
-                        )));
-                    }
-                }
 
                 let effective_policy = self.effective_protocol_policy();
                 effective_policy.validate()?;
@@ -677,7 +670,7 @@ impl RequestBuilder {
 
             let mut tcp_future = self.establish_and_send_tcp(
                 ctx,
-                body,
+                body.clone(),
                 effective_proxy_owned.clone(),
                 protocol_policy,
                 http_version_pref,
@@ -710,7 +703,23 @@ impl RequestBuilder {
                         );
                         match tcp_future.await {
                             Ok(resp) => Ok(resp),
-                            Err(tcp_error) => Err(pipeline::protocol_race_error(tcp_error, quic_error)),
+                            Err(tcp_error) if pipeline::is_connection_limit_error(&tcp_error) => {
+                                self.establish_and_send_tcp(
+                                    ctx,
+                                    body,
+                                    effective_proxy_owned,
+                                    protocol_policy,
+                                    http_version_pref,
+                                    connect_start,
+                                )
+                                .await
+                                .map_err(|retry_error| {
+                                    pipeline::protocol_race_error(retry_error, quic_error)
+                                })
+                            }
+                            Err(tcp_error) => {
+                                Err(pipeline::protocol_race_error(tcp_error, quic_error))
+                            }
                         }
                     }
                 },
@@ -736,7 +745,23 @@ impl RequestBuilder {
                         );
                         match quic_future.await {
                             Ok(resp) => Ok(resp),
-                            Err(quic_error) => Err(pipeline::protocol_race_error(tcp_error, quic_error)),
+                            Err(quic_error) if pipeline::is_connection_limit_error(&tcp_error) => {
+                                self.establish_and_send_tcp(
+                                    ctx,
+                                    body,
+                                    effective_proxy_owned,
+                                    protocol_policy,
+                                    http_version_pref,
+                                    connect_start,
+                                )
+                                .await
+                                .map_err(|retry_error| {
+                                    pipeline::protocol_race_error(retry_error, quic_error)
+                                })
+                            }
+                            Err(quic_error) => {
+                                Err(pipeline::protocol_race_error(tcp_error, quic_error))
+                            }
                         }
                     }
                 },
@@ -827,6 +852,7 @@ impl RequestBuilder {
                 session: &self.session,
                 key: ctx.conn_key,
             };
+            let permit = self.session.reserve_connection()?;
 
             let early_data_allowed = super::can_send_early_data(ctx.method, ctx.idempotency);
             tracing::trace!(
@@ -897,10 +923,9 @@ impl RequestBuilder {
 
                     if let Some(response) = response {
                         let (sender, driver) = h3_conn.into_parts();
-                        let driver = std::sync::Arc::new(driver);
                         {
                             let mut pool = self.session.inner.pool.lock();
-                            pool.insert_h3(ctx.conn_key.clone(), sender, driver);
+                            pool.insert_h3_reserved(ctx.conn_key.clone(), sender, driver, permit);
                         }
                         tracing::debug!(
                             route = %ctx.conn_key.route,
@@ -1004,11 +1029,10 @@ impl RequestBuilder {
                 .alt_svc_cache()
                 .mark_h3_validated_for_route(&discovery.route, &discovery.origin);
             let (sender, driver) = h3_conn.into_parts();
-            let driver = std::sync::Arc::new(driver);
             let mut send_sender = sender.clone();
             {
                 let mut pool = self.session.inner.pool.lock();
-                pool.insert_h3(ctx.conn_key.clone(), sender, driver);
+                pool.insert_h3_reserved(ctx.conn_key.clone(), sender, driver, permit);
             }
 
             tracing::debug!(
@@ -1038,6 +1062,7 @@ impl RequestBuilder {
         let conn_key = ctx.conn_key;
 
         Box::pin(async move {
+            let permit = self.session.reserve_connection()?;
             let client = &self.session.inner.client;
             let mut connect_config =
                 pipeline::build_connect_config(client, http_version_pref, scheme);
@@ -1056,7 +1081,9 @@ impl RequestBuilder {
                     .into_tcp_stream()?
                     .into_plain_tcp()
                     .ok_or_else(|| Error::Http("expected plain TCP for HTTP scheme".into()))?;
-                return self.send_cleartext(tcp, ctx, body, connect_start).await;
+                return self
+                    .send_cleartext(tcp, permit, ctx, body, connect_start)
+                    .await;
             }
 
             let negotiated_alpn = conn.negotiated_alpn();
@@ -1073,6 +1100,7 @@ impl RequestBuilder {
                         &self.session,
                         conn_key,
                         first_req,
+                        permit,
                     )
                     .await?;
 
@@ -1100,6 +1128,7 @@ impl RequestBuilder {
                             "http.h2_failed_falling_back_to_h1",
                         );
 
+                        let fallback_permit = self.session.reserve_connection()?;
                         let h1_config = pipeline::build_h1_only_connect_config(client, scheme);
                         let conn2 = self
                             .session
@@ -1117,7 +1146,8 @@ impl RequestBuilder {
                             "connection.established_via_fallback",
                         );
 
-                        self.send_h1_request(sender, conn_task, ctx, body).await
+                        self.send_h1_request(sender, conn_task, fallback_permit, ctx, body)
+                            .await
                     }
                     Err(e) => Err(e),
                 }
@@ -1142,7 +1172,8 @@ impl RequestBuilder {
                     "connection.established",
                 );
 
-                self.send_h1_request(sender, conn_task, ctx, body).await
+                self.send_h1_request(sender, conn_task, permit, ctx, body)
+                    .await
             }
         })
     }
@@ -1701,6 +1732,7 @@ impl RequestBuilder {
         &self,
         mut sender: hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
         conn_task: std::sync::Arc<tokio::task::JoinHandle<()>>,
+        permit: ConnectionPermit,
         ctx: &RequestContext<'_>,
         body: Option<bytes::Bytes>,
     ) -> Result<Response> {
@@ -1852,7 +1884,7 @@ impl RequestBuilder {
 
         if !connection_close {
             let mut pool = self.session.inner.pool.lock();
-            pool.return_h1(conn_key.clone(), sender, conn_task);
+            pool.return_h1_reserved(conn_key.clone(), sender, conn_task, permit);
             tracing::trace!(host = %host, "h1.connection_returned_to_pool");
         } else {
             tracing::trace!(host = %host, "h1.connection_close_not_pooled");
@@ -1889,6 +1921,7 @@ impl RequestBuilder {
     async fn send_cleartext(
         &self,
         tcp: tokio::net::TcpStream,
+        permit: ConnectionPermit,
         ctx: &RequestContext<'_>,
         body: Option<bytes::Bytes>,
         connect_start: std::time::Instant,
@@ -1907,7 +1940,8 @@ impl RequestBuilder {
                     requested = ?http_version_pref,
                     "connection.h1_cleartext"
                 );
-                self.send_h1_cleartext(tcp, ctx, body, connect_start).await
+                self.send_h1_cleartext(tcp, permit, ctx, body, connect_start)
+                    .await
             }
             PreferredHttpVersion::Http2Only => {
                 tracing::debug!(
@@ -1915,7 +1949,7 @@ impl RequestBuilder {
                     mode = "prior_knowledge",
                     "connection.h2c_prior_knowledge",
                 );
-                self.send_h2c_prior_knowledge(tcp, ctx, body, connect_start)
+                self.send_h2c_prior_knowledge(tcp, permit, ctx, body, connect_start)
                     .await
             }
             PreferredHttpVersion::Http3Only => Err(Error::InvalidConfig(
@@ -1928,6 +1962,7 @@ impl RequestBuilder {
     async fn send_h1_cleartext(
         &self,
         tcp: tokio::net::TcpStream,
+        permit: ConnectionPermit,
         ctx: &RequestContext<'_>,
         body: Option<bytes::Bytes>,
         connect_start: std::time::Instant,
@@ -1942,7 +1977,8 @@ impl RequestBuilder {
             "connection.established",
         );
 
-        self.send_h1_request(sender, conn_task, ctx, body).await
+        self.send_h1_request(sender, conn_task, permit, ctx, body)
+            .await
     }
 
     /// h2c with prior knowledge (RFC 7540 §3.4): send the HTTP/2 connection
@@ -1950,6 +1986,7 @@ impl RequestBuilder {
     async fn send_h2c_prior_knowledge(
         &self,
         tcp: tokio::net::TcpStream,
+        permit: ConnectionPermit,
         ctx: &RequestContext<'_>,
         body: Option<bytes::Bytes>,
         connect_start: std::time::Instant,
@@ -1957,15 +1994,16 @@ impl RequestBuilder {
         let client = &self.session.inner.client;
 
         let stream = crate::connect::TransportStream::plain(tcp);
-        let sender = pipeline::establish_h2_and_pool(stream, client, &self.session, ctx.conn_key)
-            .await
-            .map_err(|e| {
-                Error::connection(
-                    crate::error::ConnectionPhase::H2Negotiation,
-                    format!("h2c prior knowledge handshake failed: {e}"),
-                    None,
-                )
-            })?;
+        let sender =
+            pipeline::establish_h2_and_pool(stream, client, &self.session, ctx.conn_key, permit)
+                .await
+                .map_err(|e| {
+                    Error::connection(
+                        crate::error::ConnectionPhase::H2Negotiation,
+                        format!("h2c prior knowledge handshake failed: {e}"),
+                        None,
+                    )
+                })?;
 
         tracing::debug!(
             protocol = "h2c",
@@ -1999,6 +2037,7 @@ impl RequestBuilder {
         use http_body_util::BodyExt;
         use hyper_util::rt::TokioIo;
 
+        let permit = self.session.reserve_connection()?;
         let method = ctx.method;
         let host = ctx.host;
         let path = ctx.path;
@@ -2103,23 +2142,29 @@ impl RequestBuilder {
 
             let upgraded_io = TokioIo::new(upgraded);
 
-            let h2_conn = crate::h2::connect_h2(upgraded_io, client.h2_profile(), None)
-                .await
-                .map_err(|e| {
-                    Error::connection(
-                        crate::error::ConnectionPhase::H2cUpgrade,
-                        format!("h2c post-upgrade H2 handshake failed: {e}"),
-                        None,
-                    )
-                })?;
+            let h2_conn = crate::h2::connect_h2_with_config(
+                upgraded_io,
+                client.h2_profile(),
+                None,
+                client.max_pending_h2_requests(),
+            )
+            .await
+            .map_err(|e| {
+                Error::connection(
+                    crate::error::ConnectionPhase::H2cUpgrade,
+                    format!("h2c post-upgrade H2 handshake failed: {e}"),
+                    None,
+                )
+            })?;
             let h2_sender = h2_conn.clone_sender();
 
             {
                 let mut pool = self.session.inner.pool.lock();
-                pool.insert_h2(
+                pool.insert_h2_reserved(
                     conn_key.clone(),
                     h2_conn.clone_sender(),
                     h2_conn.into_task(),
+                    permit,
                 );
             }
 
@@ -2176,7 +2221,7 @@ impl RequestBuilder {
 
             if !connection_close {
                 let mut pool = self.session.inner.pool.lock();
-                pool.return_h1(conn_key.clone(), sender, conn_task);
+                pool.return_h1_reserved(conn_key.clone(), sender, conn_task, permit);
                 tracing::trace!(host = %host, "h2c.rejected_h1_returned_to_pool");
             }
 

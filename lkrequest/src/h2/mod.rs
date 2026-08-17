@@ -16,8 +16,8 @@ pub use lkh2::{
 
 // Unified adapter types
 pub use lkh2::{
-    H2FlowControl, H2ReadySender, H2RecvStream, H2ResponseFuture, H2SendError, H2SendStream,
-    H2Sender, UnifiedH2Connection,
+    H2DriverConfig, H2FlowControl, H2ReadySender, H2RecvStream, H2ResponseFuture, H2SendError,
+    H2SendStream, H2Sender, UnifiedH2Connection,
 };
 
 pub use lkh2::await_first_response;
@@ -38,7 +38,26 @@ pub async fn connect_h2<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    lkh2::connect_h2_native(tls_stream, h2_profile, first_request)
-        .await
-        .map_err(|e| Error::Http(e.to_string()))
+    connect_h2_with_config(tls_stream, h2_profile, first_request, None).await
+}
+
+pub(crate) async fn connect_h2_with_config<S>(
+    tls_stream: S,
+    h2_profile: &H2Profile,
+    first_request: Option<http::Request<Option<bytes::Bytes>>>,
+    max_pending_h2_requests: Option<usize>,
+) -> Result<UnifiedH2Connection>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    lkh2::connect_h2_native_with_config(
+        tls_stream,
+        h2_profile,
+        first_request,
+        H2DriverConfig {
+            max_pending_requests: max_pending_h2_requests,
+        },
+    )
+    .await
+    .map_err(|e| Error::Http(e.to_string()))
 }

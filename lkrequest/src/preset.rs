@@ -149,6 +149,16 @@ fn chrome_150_quic_profile() -> Option<QuicProfile> {
     None
 }
 
+#[cfg(feature = "quic-h3")]
+fn chrome_151_quic_profile() -> Option<QuicProfile> {
+    Some(lkh3::chrome_151_quic())
+}
+
+#[cfg(not(feature = "quic-h3"))]
+fn chrome_151_quic_profile() -> Option<QuicProfile> {
+    None
+}
+
 /// Chrome 131 client preset.
 ///
 /// QUIC/H3 currently uses the shared generic Chromium profile.
@@ -286,6 +296,24 @@ pub fn chrome_150() -> ClientPreset {
     }
 }
 
+/// Chrome 151 client preset.
+///
+/// Captured from Chrome 151.0.7922.72 on Windows. TCP TLS/H2 matches Chrome
+/// 150's stable fields, while real public-site QUIC captures remove the ML-DSA
+/// signature algorithms and retain the Chrome 150 transport/H3 shape.
+pub fn chrome_151() -> ClientPreset {
+    ClientPreset {
+        tls_profile: lktls::profile::presets::chrome_151(),
+        quic_tls_profile: Some(lktls::profile::presets::chrome_151_quic()),
+        h2_profile: crate::h2::profile::chrome_151_h2(),
+        quic_profile: chrome_151_quic_profile(),
+        default_protocol_policy: Some(ProtocolPolicy::chrome_standard()),
+        header_order: header_names(crate::h2::profile::chrome_full_header_order()),
+        h3_header_order: None,
+        cookie_order: None,
+    }
+}
+
 /// Firefox 133 client preset.
 ///
 /// A dedicated QUIC transport capture is not modelled yet, so this preset does
@@ -412,6 +440,33 @@ mod tests {
         assert_ne!(preset.quic_profile, chrome_146().quic_profile);
     }
 
+    #[cfg(feature = "quic-h3")]
+    #[test]
+    fn chrome_151_preset_uses_public_capture_profiles() {
+        let preset = chrome_151();
+        assert_eq!(preset.tls_profile.name, "Chrome 151");
+        assert_eq!(
+            preset.quic_tls_profile.as_ref().unwrap().name,
+            "Chrome 151 QUIC"
+        );
+        assert_eq!(
+            preset.quic_profile.as_ref().unwrap(),
+            &lkh3::chrome_151_quic()
+        );
+        assert_ne!(
+            preset
+                .quic_tls_profile
+                .as_ref()
+                .unwrap()
+                .signature_algorithms,
+            chrome_150()
+                .quic_tls_profile
+                .as_ref()
+                .unwrap()
+                .signature_algorithms
+        );
+    }
+
     #[test]
     fn firefox_147_preset_leaves_quic_profile_unspecified() {
         let preset = firefox_147();
@@ -492,6 +547,7 @@ mod tests {
             chrome_148(),
             chrome_149(),
             chrome_150(),
+            chrome_151(),
             firefox_133(),
             firefox_147(),
             safari_18(),

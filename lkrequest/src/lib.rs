@@ -136,7 +136,7 @@ pub use alt_svc::{
 pub use client::{Client, FallbackConfig, ResourceLimits, TimeoutConfig};
 pub use connect::{EstablishedConnection, TransportStream};
 pub use connection_pool::PoolStats;
-pub use dns::{DnsConfig, DnsResolver, HttpsRecord};
+pub use dns::{CachedSystemDns, DnsConfig, DnsResolver, HttpsRecord, SystemDnsCacheConfig};
 pub use error::{
     ConnectionClosedKind, ConnectionError, ConnectionPhase, ProxyError, ProxyErrorKind, QuicError,
     QuicPhase,

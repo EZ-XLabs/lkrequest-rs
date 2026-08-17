@@ -1,604 +1,358 @@
 # lkrequest
 
-**一个支持字节级 TLS、HTTP/2 和 HTTP/3 指纹控制的 Rust HTTP 客户端。**
+<p align="center">
+  <strong>面向 Rust HTTP 客户端的字节级浏览器指纹控制。</strong>
+</p>
 
-lkrequest 可以精确模拟真实浏览器的网络指纹——包括 TLS ClientHello、HTTP/2 SETTINGS、QUIC 传输参数和请求头顺序——适用于网页抓取、反检测研究和浏览器模拟场景。
+<p align="center">
+  <a href="README.md">English</a> ·
+  <a href="CONTRIBUTING.md">参与贡献</a> ·
+  <a href="SECURITY.md">安全说明</a> ·
+  <a href="LICENSE.txt">Apache-2.0</a>
+</p>
 
-## 功能特性
+<p align="center">
+  <img alt="Version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-4c1.svg">
+  <img alt="Rust" src="https://img.shields.io/badge/Rust-2021%2B-orange.svg">
+  <img alt="TLS" src="https://img.shields.io/badge/TLS-byte--level-blue.svg">
+  <img alt="HTTP/3" src="https://img.shields.io/badge/HTTP%2F3-optional-5c2d91.svg">
+  <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue.svg">
+</p>
 
-- **TLS 指纹控制** — 字节级 ClientHello 生成，精确匹配真实浏览器（Chrome、Firefox、Safari）
-- **HTTP/2 指纹控制** — SETTINGS 帧顺序、伪头顺序、WINDOW_UPDATE、PRIORITY 帧、每请求优先级权重
-- **HTTP/3 + QUIC** — 通过可选的 `quic-h3` feature 启用完整 HTTP/3 协议栈，支持指纹感知的传输参数、Alt-Svc 自动发现、H2→H3 无缝升级
-- **内置浏览器预设** — Chrome 131/144/145/146/147/148/149/150、Firefox 133/147、Safari 18/26（TLS + H2；启用 `quic-h3` 后再带 QUIC）
-- **指纹随机化** — 可选的 `synthetic-fp` feature：每会话生成*合成*指纹（扩展顺序抖动、预设重组、语料外扰动），可通过 `Layers` 掩码按层组合，并受可配置的“可协商底线”约束
-- **会话管理** — Cookie 容器、连接池、HTTP/2 多路复用，以及可选的 QUIC 0-RTT 会话恢复
-- **连接预热** — `session.preconnect()` 预建立 DNS + TCP + TLS + H2（启用 `quic-h3` 时也可预热 QUIC + H3）连接
-- **自定义 DNS 解析器** — 可插拔 DNS，支持 DoH，通过 HTTPS/SVCB 记录自动获取 ECH 配置和 H3 提示
-- **Alt-Svc 发现** — 通过 Alt-Svc 头自动从 HTTP/2 升级到 HTTP/3，含 QUIC 故障回退
-- **SessionPool** — 高并发会话池，支持代理轮换（轮询 / 随机）
-- **代理支持** — SOCKS5 和 HTTP CONNECT，支持认证；并支持多跳**代理链**（QUIC/H3 可在全 SOCKS5 链上运行）
-- **WebSocket** — HTTP/1.1 Upgrade (RFC 6455) 和 H2 Extended CONNECT (RFC 8441)
-- **中间件** — 拦截器链，用于请求/响应修改
-- **重试策略** — 指数退避、固定间隔、自定义策略
-- **重定向控制** — `RedirectPolicy::Follow(n)` 或 `RedirectPolicy::None` 手动处理
-- **自动解压** — Brotli、gzip、deflate、zstd
-- **阻塞式 API** — 同步包装器，适用于非异步上下文
-- **Multipart/Form-Data** — 支持流式文件上传
-- **TCP 指纹** — JA4T 风格的 TCP SYN 指纹
+`lkrequest` 是一个提供 **TLS、HTTP/2 与 HTTP/3/QUIC 线缆级控制** 的 Rust HTTP 客户端工作区。它适用于浏览器协议研究、互操作测试、指纹验证，以及普通高层 HTTP 客户端无法暴露底层格式的受控自动化场景。
 
-## 架构
+项目的核心不变量是：**浏览器预设应在网络线缆上匹配目标浏览器**。即使某项修改在协议层面合法，只要偏离真实浏览器输出，也会被视为回归。
 
-```
-┌──────────────────────────────────────────────────────────┐
-│                lkrequest（HTTP 客户端）                    │
-│                                                          │
-│   Client ──► Session ──► Request                         │
-│  （指纹模板）  （虚拟浏览器    （单次 HTTP                  │
-│                 用户）         请求）                      │
-├────────────┬────────────┬────────────┬───────────────────┤
-│   lktls    │   lkh2     │   lkh3     │   lkquic          │
-│ （TLS 指纹  │ （H2 指纹   │ （H3 指纹   │ （QUIC 端点       │
-│   引擎）    │   引擎）    │   配置）    │   抽象层）        │
-├────────────┤            ├────────────┤                   │
-│ lktls-quic │            │ deps/h3    │   deps/quinn      │
-│（QUIC-TLS  │            │（已补丁）   │  （已补丁）        │
-│  桥接层）   │            │            │                   │
-├────────────┴────────────┴────────────┴───────────────────┤
-│   密码学后端：aws-lc-rs（TLS）+ ring（QUIC）               │
-└──────────────────────────────────────────────────────────┘
-```
+> [!IMPORTANT]
+> 当前项目以源码工作区形式使用，并依赖经过补丁修改的 `quinn` 与 `h3` git submodule。构建前必须初始化子模块。
 
-| Crate | 说明 |
-|-------|------|
-| **lkrequest** | 高层 HTTP 客户端——会话、Cookie、代理、重试、WebSocket、H2/H3 双协议分发 |
-| **lkrequest-ffi** | 稳定的 C ABI 外观——同步/异步请求、流式传输、诊断、Session/Proxy 池 |
-| **lktls** | 字节级 TLS 指纹引擎——ClientHello、握手、记录层 |
-| **lktls-quic** | lktls 与 quinn 之间的桥接层，用于 QUIC 原生 TLS 1.3 握手 |
-| **lkh2** | HTTP/2 指纹控制连接——SETTINGS、HEADERS、PRIORITY |
-| **lkh3** | HTTP/3 配置与 QUIC 传输参数指纹 |
-| **lkquic** | QUIC 端点抽象层，支持可插拔后端（默认：quinn） |
-| **lkprofile** | 配置文件解析器——将原始 ClientHello / H2 / QUIC 抓包转换为指纹配置 |
-| **tools/pcap_diff** | CLI 工具，用于字节级 ClientHello 对比 |
-| **tools/profile_collector** | CLI 工具，从抓包中提取 TLS + H2 + QUIC 指纹配置 |
+> [!WARNING]
+> 仅在你拥有测试授权的系统和目标上使用本项目。请阅读[安全与负责任使用说明](SECURITY.md)。
 
-## 前置要求
+## 核心能力
 
-### Rust
+- **TLS ClientHello 控制** — 扩展顺序、GREASE、cipher suites、签名算法、key share、ECH、ALPS、证书压缩和握手行为。
+- **原生 HTTP/2 指纹** — SETTINGS 顺序、WINDOW_UPDATE、PRIORITY、伪头顺序、HPACK 行为和请求优先级。
+- **HTTP/3 与 QUIC** — 可选 H3 协议栈，支持 QUIC Transport Parameters、QPACK、PRIORITY_UPDATE、Alt-Svc、会话恢复和 SOCKS5 UDP。
+- **真实抓包驱动的预设** — Chrome 131、144–151，Firefox 133/147，Safari 18/26。
+- **浏览器式 Session** — 独立 Cookie、受物理连接上限约束的连接池、H2 stream 背压、重定向、重试、解压、流式响应、WebSocket、系统 DNS singleflight 与可选正向缓存，以及 HSTS 策略。
+- **代理编排** — HTTP CONNECT、SOCKS5、多跳代理链、解析地址回退、`ProxyPool` 和 `SessionPool`。
+- **稳定 C ABI** — `lkrequest-ffi` 将 Rust Client/Session/Request 模型暴露给其他语言。
+- **离线回归门禁** — 实际序列化的 TLS/H2/QUIC 指纹会与仓库内 golden fixture 对比。
 
-Edition 2021+（部分 crate 使用 2024）。异步运行时：**Tokio**。
+## 项目状态
 
-### Git 子模块
-
-本项目使用 quinn 和 h3 的补丁分支作为 git 子模块。构建前**必须**初始化：
-
-```bash
-git clone --recurse-submodules <仓库地址>
-
-# 如果已经 clone 但没有拉取子模块：
-git submodule update --init
-```
-
-子模块跟踪 `lkrequest-patches` 分支。更新到最新补丁：
-
-```bash
-git submodule update --remote
-```
-
-### 构建依赖
-
-- **aws-lc-rs**：使用预编译的 NASM 二进制。Windows 上通常开箱即用。
-- **ring**：quinn QUIC 加密所需。
+- 当前工作区发布版本：**0.2.1**。
+- API 已可使用，但在 1.0 前仍可能演进。
+- 当前以**源码方式**集成；下面示例使用本地 checkout。
+- HTTP/3、合成指纹、遥测和公网测试均为显式 opt-in。
+- 浏览器指纹会受版本、平台、Finch、GREASE 与请求上下文影响。预设文档会区分已抓包确认的稳定字段和变量行为。
 
 ## 快速开始
 
-在你的 `Cargo.toml` 中添加：
+### 1. Clone 与构建
+
+`deps/quinn` 和 `deps/h3` 包含工作区所需的传输层补丁，因此 Git submodule 是必需的。
+
+```bash
+git clone --recurse-submodules <repository-url>
+cd lkrequest
+cargo test --workspace
+```
+
+如果已经 clone 但没有初始化子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
+构建要求：
+
+- Rust 工具链与 Cargo。
+- 加密工具链需要时安装 NASM、CMake 和 libclang。
+- 仅在生成或修改 C header 时需要 `cbindgen`。
+
+### 2. 从本地工作区引用
+
+在另一个 Rust 项目中：
 
 ```toml
 [dependencies]
-lkrequest = { path = "lkrequest" }
-lktls = { path = "lktls" }
-tokio = { version = "1", features = ["full"] }
+lkrequest = { path = "../lkrequest/lkrequest" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-如果需要 HTTP/3 / QUIC，再显式开启：
+启用 HTTP/3：
 
 ```toml
-[dependencies]
-lkrequest = { path = "lkrequest", features = ["quic-h3"] }
+lkrequest = { path = "../lkrequest/lkrequest", features = ["quic-h3"] }
 ```
 
-### 零配置（默认 Chrome 144）
+### 3. 使用明确的浏览器预设发送请求
 
 ```rust
 use lkrequest::Client;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let client = Client::default();
-    let session = client.session().build();
-    let resp = session.get("https://httpbin.org/get").send().await?;
+    let client = Client::builder()
+        .preset(lkrequest::preset::chrome_151())
+        .build();
 
-    println!("Status: {}", resp.status());
-    println!("{}", resp.text()?);
+    // 一个 Session 对应一个虚拟浏览器用户；Cookie 和连接不会与其他
+    // Session 共享。
+    let session = client.session().build();
+    let response = session
+        .get("https://example.com/")
+        .send()
+        .await?;
+
+    println!("{}", response.status());
+    println!("{}", response.text()?);
     Ok(())
 }
 ```
 
-### 自定义指纹
+运行仓库示例：
 
-```rust
-use lkrequest::Client;
-use lkrequest::h2::profile::chrome_146_h2;
-use lktls::profile::presets;
-
-let client = Client::builder()
-    .fingerprint(presets::chrome_146())
-    .h2_profile(chrome_146_h2())
-    .default_header(
-        "user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-         (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
-    )
-    .build();
-
-let session = client.session().build();
-let resp = session.get("https://example.com/json").send().await?;
-```
-
-### 使用预设（TLS + H2 + 可选 QUIC + 请求头顺序 一体打包）
-
-```rust
-use lkrequest::{preset, Client};
-
-let client = Client::builder()
-    .preset(preset::chrome_146())
-    .build();
-```
-
-### POST JSON 请求
-
-```rust
-use serde::Serialize;
-
-#[derive(Serialize)]
-struct Payload {
-    name: String,
-    email: String,
-}
-
-let resp = session
-    .post("https://httpbin.org/post")
-    .json(&Payload {
-        name: "Alice".into(),
-        email: "alice@example.com".into(),
-    })?
-    .send()
-    .await?;
-```
-
-### 自定义请求头与 Cookie 持久化
-
-```rust
-let client = Client::builder()
-    .fingerprint(presets::chrome_146())
-    .h2_profile(chrome_146_h2())
-    .default_header("accept-language", "en-US,en;q=0.9")
-    .build();
-
-let session = client.session().build();
-
-// 单个请求的自定义头
-let resp = session
-    .get("https://httpbin.org/headers")
-    .header("x-custom-id", "12345")
-    .send()
-    .await?;
-
-// 同一 Session 内 Cookie 自动持久化
-session.get("https://httpbin.org/cookies/set/token/abc").send().await?;
-let resp = session.get("https://httpbin.org/cookies").send().await?;
-// → cookies: { "token": "abc" }
+```bash
+cargo run -p lkrequest --example basic_get
 ```
 
 ## HTTP/3 与 QUIC
 
-HTTP/3 通过 `quic-h3` feature 提供，默认不启用。
-
-先在依赖里显式打开：
-
-```toml
-lkrequest = { path = "lkrequest", features = ["quic-h3"] }
-```
-
-启用后，客户端支持多种协议模式：
-
-### 自动 H3（通过 Alt-Svc 发现）
+启用 `quic-h3` feature 后选择明确的协议策略：
 
 ```rust
-let client = Client::builder()
-    .preset(preset::chrome_146())
-    .build();
-
-let session = client.session().build();
-
-// 首次请求走 H2；服务器响应 Alt-Svc: h3=":443"
-// 后续请求自动升级到 H3
-let resp = session.get("https://example.com").send().await?;
-println!("协议: {:?}", resp.version()); // HTTP/2 或 HTTP/3
-```
-
-### 强制仅用 HTTP/3
-
-```rust
-let session = client.session()
-    .http3_only()
-    .build();
-
-let resp = session.get("https://example.com").send().await?;
-// 始终使用 QUIC + HTTP/3；如果服务器不支持则失败
-```
-
-### H3 优先，H2 回退
-
-```rust
-let session = client.session()
-    .http3_with_fallback()
-    .build();
-
-// 优先尝试 H3，QUIC 失败时回退到 H2
-let resp = session.get("https://example.com").send().await?;
-```
-
-### 禁用 HTTP/3
-
-```rust
-let client = Client::builder()
-    .fingerprint(presets::chrome_146())
-    .disable_http3()
-    .build();
-```
-
-### DNS 驱动的 H3 发现
-
-使用 DoH 时，HTTPS/SVCB DNS 记录可在连接前提供 H3 提示（ALPN `h3`）和 ECH 配置：
-
-```rust
-use lkrequest::{Client, DnsConfig};
+use lkrequest::Client;
 
 let client = Client::builder()
-    .dns(DnsConfig::CloudflareHttps)
-    .preset(preset::chrome_146())
+    .preset(lkrequest::preset::chrome_151())
     .build();
 
-// DNS HTTPS 记录 → ECH 配置 + h3 ALPN 提示 → 直接建立 H3 连接
-let session = client.session().build();
-let resp = session.get("https://cloudflare.com").send().await?;
+// 优先使用 H3，QUIC 不可用时回退 H2。
+let session = client.session().http3_with_fallback().build();
 ```
 
-### QUIC 会话恢复（0-RTT）
+常用模式：
 
-```rust
-let session = client.session().build();
+| 模式 | API | 行为 |
+|---|---|---|
+| 浏览器式 | 预设默认策略 | 使用发现机制，并记录 origin 的 QUIC 失败状态 |
+| 仅 H3 | `http3_only()` | 不允许 TCP 回退 |
+| H3 + 回退 | `http3_with_fallback()` | 优先 H3，失败后回退 H2 |
+| 仅 H2 | `http2_only()` | 强制使用 TCP HTTP/2 |
 
-// 首次连接：完整 QUIC 握手
-session.get("https://example.com").send().await?;
-
-// 第二次连接：0-RTT 恢复（如果服务器支持）
-session.get("https://example.com/page2").send().await?;
+```bash
+cargo run -p lkrequest --features quic-h3 --example basic_h3
+cargo run -p lkrequest --features quic-h3 --example h3_auto_discovery
+cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
 ```
 
-## 代理
+## 浏览器预设
 
-### 单个代理
+高层预设会打包 TLS、H2、可选 QUIC/H3、协议策略和请求头顺序：
 
-```rust
-use lkrequest::proxy::ProxyConfig;
+| 浏览器家族 | 预设 |
+|---|---|
+| Chrome | `chrome_131`、`chrome_144`–`chrome_151` |
+| Firefox | `firefox_133`、`firefox_147` |
+| Safari | `safari_18`、`safari_26` |
 
-let session = client.session()
-    .proxy(ProxyConfig::parse("socks5://user:pass@proxy:1080")?)
-    .build();
-```
-
-### 代理链（多跳）
-
-经一串有序代理转发（客户端 → hop1 → hop2 → … → 目标）。
-TCP（HTTP/1.1、HTTP/2）支持 HTTP CONNECT 与 SOCKS5 任意混合的跳。
-**QUIC/HTTP/3** 支持在**全 SOCKS5** 链上运行（嵌套 UDP ASSOCIATE）；
-链中若含 HTTP 跳，QUIC 会报错并回退到 H2。
+为保证可复现性，建议明确指定版本：
 
 ```rust
-use lkrequest::proxy::ProxyConfig;
-
-// 客户端 → hop1 → hop2 → 目标
-let chain = ProxyConfig::parse_chain([
-    "socks5://user:pass@hop1:1080",
-    "socks5://user:pass@hop2:1080",
-])?;
-
-let session = client.session()
-    .proxy_config(chain)
+let client = lkrequest::Client::builder()
+    .preset(lkrequest::preset::chrome_151())
     .build();
 ```
 
-### SessionPool 代理轮换
+Chrome 151 已通过 Windows 真实抓包验证。其 TCP TLS/H2 稳定字段与 Chrome 150 一致；多个公网 H3 站点的真实 QUIC 抓包使用经典 QUIC 签名算法列表并追加 `rsa_pkcs1_sha1`，不包含 TCP 中的三个 ML-DSA 项。
+
+## 能力矩阵
+
+| 能力 | 默认启用 | Feature / crate |
+|---|---:|---|
+| HTTP/1.1 | 是 | `lkrequest` |
+| 可控指纹的原生 HTTP/2 | 是 | `h2-native` |
+| HTTP/3 + QUIC | 否 | `quic-h3` |
+| 公网 E2E 辅助测试 | 否 | `network-e2e` |
+| 合成指纹 | 否 | `synthetic-fp` |
+| 运行指标遥测 | 否 | `telemetry` |
+| C ABI | 独立 crate | `lkrequest-ffi` |
+
+合成模式会刻意生成不对应任何真实浏览器的指纹。它不是浏览器预设的替代品，也不应在需要 allowlist 身份的场景中使用。
+
+TLS 1.2 与 TLS 1.3 服务端在“请求但不强制要求”客户端证书时可正常握手：`lkrequest` 会携带正确握手上下文发送空的客户端 `Certificate`。显式配置客户端身份以完成双向 TLS（mTLS）目前尚未进入公开 API。
+
+## 代理、DNS 与 Session Pool
+
+支持的代理路径：
+
+- TCP 协议支持 HTTP CONNECT 与 SOCKS5。
+- QUIC/H3 支持 SOCKS5 UDP。
+- 支持多跳代理链；QUIC 链要求每一跳都支持 SOCKS5 UDP。
+- 直连 TCP 与 SOCKS5 建连会按 resolver 返回顺序尝试多个地址，单个不可达的 IPv4 或 IPv6 地址不会直接终止整条路由。
+- `ProxyPool` 用于代理分配与并发控制。
+- `SessionPool` 用于复用虚拟浏览器 Session。
+### 系统 DNS 并发合并与缓存
+
+默认 `SystemDns` 会调用操作系统解析器，并在进程范围内自动合并相同 `(host, port)` 的并发查询，避免大量 Session 在同一时刻重复触发 `getaddrinfo`。当前等待者会共享成功结果或错误；单个等待者被取消不会取消共享查询；查询完成后默认不保留结果缓存。
+
+如果同一批域名会在查询完成后被频繁重复访问，可以启用短周期正向缓存：
 
 ```rust
 use std::time::Duration;
-use lkrequest::{Client, SessionPool};
-use lkrequest::proxy::ProxyConfig;
+use lkrequest::{Client, SystemDnsCacheConfig};
 
-let pool = SessionPool::builder()
-    .client(&client)
-    .proxies(vec![
-        ProxyConfig::parse("socks5://user:pass@proxy1:1080")?,
-        ProxyConfig::parse("http://user:pass@proxy2:8080")?,
-    ])
-    .max_sessions(100)
-    .idle_timeout(Duration::from_secs(300))
-    .build();
-
-let guard = pool.acquire().await;
-let resp = guard.get("https://httpbin.org/ip").send().await?;
-// guard 被 drop → Session 回归池中
-```
-
-### 动态代理提供者
-
-```rust
 let client = Client::builder()
-    .preset(preset::chrome_146())
-    .build();
-
-let pool = SessionPool::builder()
-    .client(&client)
-    .proxy_fn(|| async {
-        // 每次调用返回一个新的代理
-        Ok(ProxyConfig::parse("http://rotating-proxy.example.com:8080")?)
-    })
+    .system_dns_cache(
+        SystemDnsCacheConfig::positive(Duration::from_secs(30))
+            .with_max_entries(4096),
+    )
     .build();
 ```
 
-## DNS 配置
+缓存属于当前 resolver 实例，只保存成功且非空的地址列表，不缓存错误。TTL 或容量设为零会关闭已完成结果缓存，但仍保留并发查询合并。Resolver 配置方法互相替换，因此 `.dns()`、`.dns_resolver()` 和 `.system_dns_cache()` 中最后一次调用生效。需要自定义 DNS 服务器、DoH/DoT、HTTPS/SVCB 记录或 ECH 发现时，应继续使用 `DnsConfig` 或自定义 `DnsResolver`。
 
-```rust
-use lkrequest::{Client, DnsConfig};
+常见选择：
 
-// 预设解析器
-let client = Client::builder().dns(DnsConfig::System).build();          // 系统默认
-let client = Client::builder().dns(DnsConfig::GoogleHttps).build();     // Google DoH
-let client = Client::builder().dns(DnsConfig::CloudflareHttps).build(); // Cloudflare DoH
-let client = Client::builder().dns(DnsConfig::Quad9Https).build();      // Quad9 DoH
+- **同一 origin 的瞬时并发请求：** 直接使用默认配置，singleflight 会自动生效。
+- **短时间内重复访问同一批域名：** 启用带 TTL 与容量限制的正向缓存。
+- **强调权威 DNS 实时性或需要自定义 DNS 传输：** 保持缓存关闭，或使用自定义 resolver。
 
-// DoH 解析器还会获取 HTTPS/SVCB 记录，用于：
-// - ECH（加密客户端 Hello）配置自动发现
-// - H3 ALPN 提示，支持直接建立 QUIC 连接
-```
+### 连接池限制与 0.2.1 迁移说明
 
-## 连接预热
+连接上限按实际 H1/H2/H3 物理连接计数，而不是按复用请求数计数。原生 H2 会遵守对端的并发 stream 上限，并在容量耗尽时施加背压，而不是静默降级到 H1 或无限创建连接。重定向过程中遇到失效的池化 H1 连接时，会淘汰旧连接并通过正常重试策略重新建连。
 
-```rust
-let session = client.session().build();
-
-// 预建立连接（DNS + TCP + TLS + H2 SETTINGS，或 DNS + QUIC + H3）
-session.preconnect("https://api.example.com").await?;
-
-// 后续请求复用预热连接
-let resp = session.get("https://api.example.com/data").send().await?;
-
-// 批量并发预热多个源
-session.preconnect_many(&[
-    "https://api.example.com",
-    "https://cdn.example.com",
-]).await;
-```
-
-## 重试与重定向
-
-### 重试策略
-
-```rust
-use lkrequest::retry::{RetryPolicy, ExponentialBackoff, FixedInterval};
-
-let session = client.session()
-    .retry_policy(ExponentialBackoff::new(3))  // 3 次指数退避重试
-    .build();
-
-// 或固定间隔
-let session = client.session()
-    .retry_policy(FixedInterval::new(3, Duration::from_secs(1)))
-    .build();
-```
-
-### 重定向控制
-
-```rust
-use lkrequest::RedirectPolicy;
-
-// 自动跟随最多 10 次重定向（默认）
-let session = client.session().build();
-
-// 禁用自动重定向
-let session = client.session()
-    .redirect_policy(RedirectPolicy::None)
-    .build();
-
-// 自定义次数限制
-let session = client.session()
-    .max_redirects(5)
-    .build();
-```
-
-## WebSocket
-
-```rust
-let session = client.session().build();
-
-// HTTP/1.1 Upgrade 或 H2 Extended CONNECT（根据连接自动选择）
-let ws = session.websocket("wss://echo.websocket.org")
-    .header("Origin", "https://example.com")
-    .connect()
-    .await?;
-```
-
-## 超时配置
+新代码应通过 `Session` 配置和观察连接池：
 
 ```rust
 use std::time::Duration;
+use lkrequest::Client;
 
-let client = Client::builder()
-    .dns_timeout(Duration::from_secs(5))           // DNS 解析超时
-    .tcp_connect_timeout(Duration::from_secs(10))   // TCP 连接超时
-    .tls_handshake_timeout(Duration::from_secs(10)) // TLS 握手超时
-    .ttfb_timeout(Duration::from_secs(30))          // 首字节超时
-    .total_timeout(Duration::from_secs(60))         // 总请求超时
+let client = Client::builder().build();
+let session = client
+    .session()
+    .max_connections(32)
+    .idle_timeout(Duration::from_secs(90))
     .build();
+
+let stats = session.pool_stats();
+println!("physical connections: {}/{}", stats.total, stats.max_total);
 ```
 
-## 指纹验证
+0.2.0 已发布的低层 `ConnectionPool` 获取与写入方法在 0.2.1 中继续保持源码兼容，但已标记为 deprecated，因此 IDE 会提示迁移。现有调用方可以先升级版本再逐步改造；新集成应直接使用 Session 管理的连接池。这些兼容入口计划在 0.3.0 移除。
 
-```rust
-// 验证 TLS + H2 指纹
-let resp = session.get("https://example.com/json").send().await?;
-let json: serde_json::Value = resp.json()?;
-println!("JA3:    {}", json["ja3_hash"]);
-println!("JA4:    {}", json["ja4"]);
-println!("Akamai: {}", json["akamai_hash"]);
+相关示例：
 
-// 验证 H3/QUIC 指纹
-let h3_session = client.session().http3_only().build();
-let resp = h3_session.get("https://quic.browserleaks.com/json").send().await?;
+```bash
+cargo run -p lkrequest --example proxy_pool
+cargo run -p lkrequest --example session_pool
+cargo run -p lkrequest --example proxy_dynamic
+cargo run -p lkrequest --features quic-h3 --example h3_socks5_force
+cargo run -p lkrequest --example dns_proxy_probe
 ```
 
-## 内置指纹配置
+## 架构
 
-### TLS 配置
+```text
+lkrequest-ffi
+      │
+      ▼
+lkrequest ───────────── 高层 Client / Session / Request API
+  │       │       │
+  ▼       ▼       ▼
+lktls    lkh2    lkh3 + lkquic
+  │                 │
+  ▼                 ▼
+lktls-quic       patched h3 / quinn submodules
+```
 
-| 配置 | JA3 Hash | 浏览器 |
-|------|----------|--------|
-| `chrome_131()` | — | Chrome 131 (Windows) |
-| `chrome_144()` | `991d71ee69967b7325077b71bad10393` | Chrome 144 (Windows) |
-| `chrome_145()` | — | Chrome 145 (Windows) |
-| `chrome_146()` | `991d71ee69967b7325077b71bad10393` | Chrome 146 (Windows) |
-| `chrome_147()` | — | Chrome 147 (Windows) |
-| `chrome_148()` | — | Chrome 148 (Windows) |
-| `chrome_149()` | — | Chrome 149 (Windows) |
-| `chrome_150()` | — | Chrome 150 (Windows) |
-| `firefox_133()` | — | Firefox 133 |
-| `firefox_147()` | — | Firefox 147 |
-| `safari_18()` | — | Safari 18 (macOS) |
-| `safari_26()` | — | Safari 26 (macOS) |
+| 组件 | 职责 |
+|---|---|
+| `lkrequest` | Session、请求、Cookie、连接池、代理、DNS、重试、重定向与流式响应 |
+| `lktls` | Sans-I/O TLS 引擎与字节级 ClientHello profile |
+| `lkh2` | 原生 H2 codec、HPACK、SETTINGS、优先级和请求头顺序 |
+| `lkh3` | HTTP/3/QPACK profile 与 H3 请求行为 |
+| `lkquic` | QUIC endpoint 与后端集成 |
+| `lktls-quic` | QUIC 的 TLS 1.3 bridge |
+| `lkprofile` | 指纹解析与规范化 |
+| `lkrequest-ffi` | 稳定 C ABI 与生成的 C header |
+| `tools/profile_collector` | 浏览器抓取与 preset 导出 |
+| `tools/pcap_diff` | 字节级抓包比较 |
+| `tools/fpverify` | 规范化指纹验证 |
 
-> **Chrome 150** 在线缆层与 Chrome 149 一致，**唯一区别**（从 TLS/H2 (TCP) ClientHello 抓包所得）是在 `signature_algorithms` 最前面加了三个 ML-DSA 后量子签名码点（`0x0904`/`0x0905`/`0x0906` = `mldsa44`/`65`/`87`）。这会改变 **JA4**、但不影响 **JA3**（JA3 不含签名算法）；且无需任何 PQC 加密实现——码点只是广告，真实服务器不会真的协商它。
->
-> **Chrome 150 的 HTTP/3 未随之更新。** `preset::chrome_150()` 的 QUIC/H3 仍复用共享的 Chrome 146 传输 profile（与 Chrome 144–149 一致），因此其 QUIC ClientHello **暂不带** ML-DSA 签名算法。Chrome 150 的 H3 抓包待补——本地抓取被 Chrome 对 QUIC 的证书强制校验挡住。
+## 指纹方法论
 
-### 客户端预设（TLS + H2 + 可选 QUIC + 请求头/Cookie 顺序）
+所有 profile 均遵循 **capture-first**：
 
-| 预设 | 包含内容 |
-|------|----------|
-| `preset::chrome_146()` | TLS + H2 + 可选 QUIC 配置 + 请求头顺序 + Cookie 顺序 |
-| `preset::chrome_147()` | TLS + H2 + 可选 QUIC 配置 + 请求头顺序 + Cookie 顺序 |
-| （更多） | 参见 `lkrequest/src/preset.rs` |
+1. 使用 `tools/profile_collector`、Wireshark/tshark 或受控本地服务抓取真实浏览器。
+2. 将稳定字段与每连接、每请求上下文变量分开。
+3. 在能够表达该行为的最高层建模。
+4. 通过真实 TLS/H2/H3 实现完成序列化。
+5. 与规范化抓包及仓库内 golden 文件对比。
 
-指纹配置以 JSON 文件形式定义在 `lktls/profiles/` 目录下，可使用 `profile_collector` 工具从抓包中提取自定义配置来扩展。
+不要为了让测试通过而手工修改 `lktls/profiles/*.json`。目标浏览器版本发生变化时，应重新抓取。
 
-## TLS 能力
+## 测试
 
-- TLS 1.2 和 TLS 1.3 握手（包括静态 RSA 密钥交换套件）
-- 扩展顺序控制（对指纹匹配至关重要）
-- GREASE 支持（密码套件、扩展、命名组）
-- ECH（加密客户端 Hello）支持，通过 DNS 自动发现
-- 会话恢复（PSK / Session Tickets）
-- ALPS（应用层协议设置）
-- 证书压缩（Brotli）
-- 密码学后端：`aws-lc-rs`（支持 ML-KEM-768 后量子密钥交换、TLS 1.2 CBC）
-- 证书验证，支持自定义 CA 根证书
+默认 CI 完全离线且可确定：
 
-## HTTP/2 能力
+```bash
+cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-- SETTINGS 帧参数顺序控制
-- 伪头顺序（`:method`、`:authority`、`:scheme`、`:path`）
-- 连接级 WINDOW_UPDATE
-- HEADERS 流依赖，支持可配置策略（Flat / Chain）
-- 独立 PRIORITY 帧
-- 每请求优先级，支持浏览器感知的 urgency-to-weight 映射（RFC 9218）
+QUIC/H3：
 
-## HTTP/3 与 QUIC 能力
+```bash
+cargo test -p lkrequest --features quic-h3
+```
 
-- 基于补丁版 quinn 的完整 QUIC UDP 传输
-- QUIC 传输参数指纹（initial_max_data、max_streams 等）
-- Alt-Svc 头解析，自动 H2→H3 升级
-- HTTPS/SVCB DNS 记录解析，用于 H3 发现
-- QUIC 会话恢复和 0-RTT
-- QUIC 故障追踪，自动回退到 H2
-- H3 专用请求头顺序控制
+公网测试默认标记为 ignored，仅应在得到明确授权后运行：
 
-## FFI（C ABI）
+```bash
+TEST_ALLOW_NETWORK=1 cargo test --workspace -- --include-ignored
+```
 
-`lkrequest-ffi` 为非 Rust 使用者提供稳定的 C ABI。
+测试分层和环境要求见 [docs/TESTING.md](docs/TESTING.md)。
 
-导出对象模型：
-- `Client` / `Session` / `Request` / `Response` / `StreamingResponse` / `Error` / `Op`
-- `ProxyPool` / `ProxyPoolBuilder` / `ProxyGuard`
-- `SessionPool` / `SessionPoolBuilder` / `SessionPoolGuard`
-- `Multipart`
+## C ABI
 
-FFI 覆盖功能：
-- 同步 + 异步请求执行，支持 H1/H2/H3 协议选择
-- 流式读取，含诊断信息和请求头查询
-- Session Cookie CRUD、预连接、连接池统计
-- ProxyPool / SessionPool 获取、标记坏代理
-- Multipart/form-data 请求体
-- DNS 预设/自定义配置和系统证书开关
-- 文件日志和回调日志
-
-公共 C 头文件由 `build.rs`（通过 cbindgen）在构建时生成于 `lkrequest-ffi/include/lkrequest.h`，不提交到仓库。
+`lkrequest-ffi` 为 Client、Session、Request、Response、流式读取、代理/Session Pool、multipart、错误和异步操作提供 opaque handle。
 
 ```bash
 cargo test -p lkrequest-ffi
+cargo clippy -p lkrequest-ffi --all-targets --all-features -- -D warnings
 ```
 
-## 示例
+C header 从 Rust 导出自动生成：
 
 ```bash
-# 基础用法
-cargo run -p lkrequest --example basic_get
-cargo run -p lkrequest --example post_json
-cargo run -p lkrequest --example custom_headers
-
-# 指纹验证
-cargo run -p lkrequest --example fingerprint_check
-cargo run -p lkrequest --example fingerprint_check_146
-cargo run -p lkrequest --example fingerprint_compare
-
-# HTTP/3 与 QUIC
-cargo run -p lkrequest --features quic-h3 --example basic_h3
-cargo run -p lkrequest --features quic-h3 --example h3_vs_h2
-cargo run -p lkrequest --features quic-h3 --example h3_auto_discovery
-cargo run -p lkrequest --features quic-h3 --example h3_fingerprint_check
-cargo run -p lkrequest --features quic-h3 --example h3_session_resumption
-cargo run -p lkrequest --features quic-h3 --example h3_dns_to_response
-cargo run -p lkrequest --features quic-h3 --example fingerprint_compare_quic
-
-# 代理与连接池
-cargo run -p lkrequest --example session_pool
-cargo run -p lkrequest --example proxy_pool
-
-# 请求头顺序
-cargo run -p lkrequest --example header_order_test
-
-# ECH
-cargo run -p lkrequest --example ech_test
+cd lkrequest-ffi
+cbindgen . --config cbindgen.toml > include/lkrequest.h
 ```
 
-## Cargo Features
+所有权、线程和 ABI 规则见 [lkrequest-ffi/README.md](lkrequest-ffi/README.md)。
 
-| Feature | 默认 | 说明 |
-|---------|------|------|
-| `h2-native` | 是 | 使用 lkh2 原生 HPACK 编码器，实现完整 H2 指纹控制 |
-| `quic-h3` | 否 | 启用 QUIC / HTTP/3 支持、QUIC 预设，以及 H3 相关示例和测试 |
-| `network-e2e` | 否 | 启用公网集成测试（默认 CI 不运行） |
+## 文档与示例
+
+- [测试指南](docs/TESTING.md)
+- [贡献指南](CONTRIBUTING.md)
+- [安全与负责任使用](SECURITY.md)
+- [FFI 指南](lkrequest-ffi/README.md)
+- [Rust 示例](lkrequest/examples)
+- [指纹回归设计](docs/fingerprint-regression-design.md)
+- [QUIC/H3 指纹说明](docs/chrome146-quic-h3-fingerprint.md)
+
+## 参与贡献
+
+欢迎贡献。指纹变更必须提供证据，说明新输出与真实浏览器抓包之间的关系。请明确区分源码修改、golden 更新、测试结果和经验性结论。
+
+提交 Pull Request 前，请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 并运行相关离线门禁。
 
 ## License
 
-Apache License 2.0 — Copyright 2026 EZXLabs
+项目基于 [Apache License 2.0](LICENSE.txt) 发布。

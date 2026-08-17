@@ -124,7 +124,7 @@ async fn test_proxy_auth_success() {
     let proxy = start_local_proxy_with_auth("testuser", "testpass").await;
     let client = chrome_client();
 
-    let proxy_url = format!("http://YOUR_PROXY_USER:YOUR_PROXY_PASS@proxy.example.com:1080:{}", proxy.addr.port());
+    let proxy_url = format!("http://testuser:testpass@127.0.0.1:{}", proxy.addr.port());
     let session = client.session().proxy(&proxy_url).build();
 
     let resp = session
@@ -143,7 +143,7 @@ async fn test_proxy_auth_failure() {
     let proxy = start_local_proxy_with_auth("testuser", "testpass").await;
     let client = chrome_client();
 
-    let proxy_url = format!("http://YOUR_PROXY_USER:YOUR_PROXY_PASS@proxy.example.com:1080:{}", proxy.addr.port());
+    let proxy_url = format!("http://wrong:creds@127.0.0.1:{}", proxy.addr.port());
     let session = client.session().proxy(&proxy_url).build();
 
     let result = session.get(&url_join(&srv.base_url, "/get")).send().await;

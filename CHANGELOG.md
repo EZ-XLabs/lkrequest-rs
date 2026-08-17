@@ -10,11 +10,47 @@ No unreleased changes yet.
 
 
 
+## lkrequest 0.2.1
+
+This patch release contains reliability, compatibility, and release-artifact fixes developed after **v0.2.0**.
+
+### Fixes
+
+- **Optional TLS client-certificate requests** — TLS 1.2 and TLS 1.3 now send an empty client `Certificate` when a server requests a client certificate but does not require one. TLS 1.3 echoes the request context and both protocol paths preserve the correct transcript. Explicit client-certificate authentication remains outside the public API.
+- **HTTP/2 informational responses and connection accounting** — native H2 consumes `1xx` responses such as `103 Early Hints` until the final response arrives. Session connection limits now count physical H1/H2/H3 connections instead of multiplexed streams, including raced H2 drivers that may already own an active request.
+- **HTTP/1.1 redirect reconnects** — canceled or closed pooled H1 connections encountered while following a redirect are classified as connection closures, evicted, and retried on a fresh connection.
+- **Resolved-address fallback** — direct TCP and SOCKS5 connection setup retry resolved IPv4/IPv6 candidates in resolver order instead of failing after the first address.
+- **System DNS request coalescing and optional positive cache** — the default `SystemDns` now coalesces concurrent lookups for the same `(host, port)` process-wide, shares successes and errors between waiters, and keeps the lookup alive if the initiating waiter is canceled. Completed lookups remain uncached by default. `SystemDnsCacheConfig` and `ClientBuilder::system_dns_cache` provide an opt-in instance-local positive cache with configurable TTL and capacity; errors and empty results are never cached.
+- **HTTP/2 stream-limit backpressure** — requests wait for capacity when the peer's concurrent-stream limit is exhausted, preventing unnecessary H1 fallback and excess physical connections.
+- **Legacy `ConnectionPool` API compatibility** — the low-level acquisition and mutation signatures published in 0.2.0 are restored as deprecated wrappers. Checked-out H1 permits remain accounted across pool clearing, and legacy H3 permits stay attached until their driver terminates instead of aborting active work during ordinary eviction. Internal Session paths continue using permit-aware methods while downstream users migrate before the wrappers are removed in 0.3.0.
+
+### CI and Compatibility
+
+- **Portable Linux FFI artifacts** — the FFI build image is pinned to Debian bookworm and CI verifies that published shared libraries require no GLIBC symbol newer than 2.36.
+
+### 修复（中文）
+
+- **TLS 可选客户端证书请求** — TLS 1.2 与 TLS 1.3 服务端请求但不强制要求客户端身份时，现在会发送空的客户端 `Certificate`。TLS 1.3 会回显 request context，两个协议路径都会维护正确的 transcript。显式客户端证书认证仍不属于当前公开 API。
+- **HTTP/2 信息响应与连接计数** — 原生 H2 会持续消费 `103 Early Hints` 等 `1xx` 响应，直到最终响应到达。Session 连接上限现在按实际 H1/H2/H3 物理连接计数，而不是按复用 stream 计数；已经承载活动请求的竞态 H2 driver 也会被正确计入。
+- **HTTP/1.1 重定向重连** — 跟随重定向时遇到被取消或关闭的池化 H1 连接，会将其识别为连接关闭、淘汰并通过新连接重试。
+- **解析地址回退** — 直连 TCP 与 SOCKS5 建连会按 resolver 顺序重试多个 IPv4/IPv6 地址，而不是首个地址失败后立即终止。
+- **系统 DNS 请求合并与可选正向缓存** — 默认 `SystemDns` 会在进程范围内合并相同 `(host, port)` 的并发查询，让等待者共享成功结果或错误；即使最初发起查询的等待者被取消，底层查询仍会继续。查询完成后默认不缓存。新增 `SystemDnsCacheConfig` 与 `ClientBuilder::system_dns_cache`，可按实例启用带 TTL 和容量限制的正向缓存；错误和空结果不会进入缓存。
+- **HTTP/2 stream 上限背压** — 对端并发 stream 容量耗尽时，请求会等待可用容量，避免不必要的 H1 降级和额外物理连接。
+- **旧版 `ConnectionPool` API 兼容** — 恢复 0.2.0 已发布的低层获取与写入签名，并标记为 deprecated。已取出的 H1 连接在清空池时仍会保留物理连接计数，旧版 H3 permit 也会持续绑定到 driver 结束，普通淘汰不会中断仍在运行的任务。Session 内部路径继续使用携带 permit 的方法，兼容入口计划在 0.3.0 移除。
+
+### CI 与兼容性（中文）
+
+- **Linux FFI 产物兼容性** — FFI 构建镜像固定为 Debian bookworm，CI 同时验证发布的动态库不会依赖高于 GLIBC 2.36 的符号版本。
+
+
+
 ## lkrequest 0.2.0
 
 This release includes the changes developed since the initial **v0.1.0** release.
 
 ### 🚀 Features
+
+- **Chrome 151 TLS / H2 / H3 preset** — Captured from Chrome 151.0.7922.72 on Windows on July 31, 2026. TCP TLS/H2 stable fields match Chrome 150. Public QUIC captures across Cloudflare, Google, Slack, and other H3 origins consistently remove the three ML-DSA signature algorithms while keeping the classic list plus `rsa_pkcs1_sha1`; QUIC transport and H3 SETTINGS remain aligned with Chrome 150's stable shape. Rust, FFI, synthesis, and profile-collector preset registries now expose `chrome_151`.
 
 - **Dedicated Chrome 150 QUIC / HTTP/3 preset** — Chrome 150 now has its own QUIC-TLS and H3 profiles instead of reusing Chrome 146. The preset covers the captured signature-algorithm set, QUIC transport parameters, QPACK limits, navigation `PRIORITY_UPDATE`, connection-ID lengths, and Initial datagram sizing; milestone-, platform-, GREASE-, and Finch-dependent fields remain explicitly version-sensitive.
 - **Fingerprint Randomization (`synthetic-fp`)** — Per-session *synthetic* fingerprints that stay browser-plausible: extension-order jitter, recombination from the shipped-preset corpus, and full out-of-corpus value perturbation — composable per layer (TLS / H2 / QUIC) through a `Layers` mask and materialized per session from a seed. A configurable **negotiability floor** keeps every synthetic ClientHello able to complete a real TLS handshake.
@@ -31,6 +67,7 @@ This release includes the changes developed since the initial **v0.1.0** release
 - **TLS handshake reassembly across records** — a handshake message fragmented across several TLS records (RFC 8446 §5.1) — e.g. a large server Certificate flight, as Facebook sends — no longer fails the handshake with `truncated handshake message in record`. Both the TLS 1.3 and TLS 1.2 read paths now buffer decrypted handshake bytes and process only complete messages, matching what the QUIC path already did. Receive-side only: the ClientHello and all wire-visible client output (JA3/JA4/JA4_r, Akamai hash) are byte-for-byte unchanged.
 - **Real ECH correctness & hardening** — corrected the Encrypted-ClientHello transcript, gated SVCB/ECH discovery lookups behind remote-DNS to close a DNS leak on `socks5h`/CONNECT routes, and restricted ALPS to HTTP/1.1 where applicable.
 - **ALPS advertisement decoupled from payload** — advertising ALPS in the ClientHello no longer forces a non-empty client-settings payload, matching real Chrome (which advertises ALPS with an empty payload — a server-visible tell otherwise).
+- **HTTP/2 `1xx` interim responses** — the native HTTP/2 driver now consumes `1xx` informational responses (e.g. `103 Early Hints`, which Cloudflare sends ahead of its `200`) and returns the subsequent final response, instead of surfacing the interim status as the final one. Fixes `GET https://www.cloudflare.com/` returning `103` instead of `200`.
 - **HTTP/2 frame-size bound** — inbound frames are bounded by *our* advertised `MAX_FRAME_SIZE`, not the peer's.
 - **Certificate DER bounds-checking** — a malicious certificate can no longer panic the TLS layer via out-of-range DER slices.
 - **Redirect handling** — the total timeout now spans the entire redirect chain, `303 See Other` is followed correctly, and an opt-in `https_only` knob is available.
@@ -45,6 +82,8 @@ This release includes the changes developed since the initial **v0.1.0** release
 ---
 
 ### 🚀 功能（中文）
+
+- **Chrome 151 TLS / H2 / H3 预设** — 已于 2026 年 7 月 31 日从 Windows Chrome 151.0.7922.72 实际抓取。TCP TLS/H2 稳定字段与 Chrome 150 一致；Cloudflare、Google、Slack 等多个公网 H3 站点的 QUIC 抓包一致移除了三个 ML-DSA 签名算法，保留经典列表并追加 `rsa_pkcs1_sha1`，QUIC Transport Parameters 与 H3 SETTINGS 的稳定形状延续 Chrome 150。Rust、FFI、合成语料和 profile-collector 均已注册 `chrome_151`。
 
 - **独立 Chrome 150 QUIC / HTTP/3 预设** — Chrome 150 不再复用 Chrome 146 的 QUIC-TLS 与 H3 profile；新预设覆盖抓包确认的签名算法、QUIC Transport Parameters、QPACK 上限、导航请求 `PRIORITY_UPDATE`、Connection ID 长度和 Initial datagram 尺寸。与 milestone、平台、GREASE 和 Finch 相关的字段继续明确标记为版本易变项。
 - **指纹随机化（`synthetic-fp`）** — 每个会话生成保持“像浏览器”的*合成*指纹：扩展顺序抖动、从已内置预设语料库重组、以及完全的语料外取值扰动 —— 可通过 `Layers` 掩码按层（TLS / H2 / QUIC）组合，并由种子在每个会话中具体化。可配置的**可协商底线**保证每个合成 ClientHello 都能完成真实 TLS 握手。
@@ -61,6 +100,7 @@ This release includes the changes developed since the initial **v0.1.0** release
 - **TLS 握手跨 record 重组** — 一条握手消息被拆分到多个 TLS record 时（RFC 8446 §5.1，例如 Facebook 那样较大的服务器 Certificate flight），不再以 `truncated handshake message in record` 握手失败。TLS 1.3 与 TLS 1.2 的读取路径现在都会缓冲解密后的握手字节、只处理完整消息（QUIC 路径早已如此）。**仅接收侧改动**:ClientHello 及所有线上可见的客户端输出(JA3/JA4/JA4_r、Akamai hash)逐字节不变。
 - **真实 ECH 正确性与加固** — 修正加密 ClientHello 的转录（transcript）；把 SVCB/ECH 发现查询限制在远程 DNS 下，堵住 `socks5h`/CONNECT 路由上的 DNS 泄漏；在适用处将 ALPS 限定为 HTTP/1.1。
 - **ALPS 宣告与载荷解耦** — 在 ClientHello 里宣告 ALPS 不再强制一个非空的 client-settings 载荷，与真实 Chrome 一致（Chrome 宣告 ALPS 但载荷为空 —— 否则是一个服务端可见的破绽）。
+- **HTTP/2 `1xx` 中间响应** — 原生 HTTP/2 驱动现在会消费 `1xx` 信息性响应（如 `103 Early Hints`，Cloudflare 会在 `200` 之前发送）并返回随后的最终响应，而不再把中间状态当作最终响应上报。修复了 `GET https://www.cloudflare.com/` 返回 `103` 而非 `200` 的问题。
 - **HTTP/2 帧大小上限** — 入站帧以*我方*宣告的 `MAX_FRAME_SIZE` 为界，而非对端的。
 - **证书 DER 边界检查** — 恶意证书不再能通过越界的 DER 切片让 TLS 层 panic。
 - **重定向处理** — 总超时现在覆盖整条重定向链，`303 See Other` 被正确跟随，并提供可选的 `https_only` 开关。
@@ -85,7 +125,7 @@ This release includes the changes developed since the initial **v0.1.0** release
 - **TLS Fingerprint Control** — Byte-level ClientHello generation that matches real browsers (Chrome, Firefox, Safari)
 - **HTTP/2 Fingerprint Control** — SETTINGS frame order, pseudo-header order, WINDOW_UPDATE, PRIORITY frames, and per-request priority weights
 - **HTTP/3 + QUIC** — Optional `quic-h3` feature for full HTTP/3 over QUIC with fingerprint-aware Transport Parameters, Alt-Svc auto-discovery, and H2→H3 seamless upgrade
-- **Built-in Browser Presets** — Chrome 131/144/145/146/147/148/149/150, Firefox 133/147, Safari 18/26 (TLS + H2, plus QUIC when `quic-h3` is enabled)
+- **Built-in Browser Presets** — Chrome 131/144/145/146/147/148/149/150/151, Firefox 133/147, Safari 18/26 (TLS + H2, plus QUIC when `quic-h3` is enabled)
 - **Session Management** — Cookie jars, connection pooling, HTTP/2 multiplexing, and optional QUIC 0-RTT session resumption
 - **Connection Prewarming** — `session.preconnect()` pre-establishes DNS + TCP + TLS + H2 (or, with `quic-h3`, QUIC + H3) connections
 - **Custom DNS Resolver** — Pluggable DNS with DoH support, auto ECH config and H3 hints via HTTPS/SVCB records
@@ -100,8 +140,6 @@ This release includes the changes developed since the initial **v0.1.0** release
 - **Blocking API** — Synchronous wrapper for non-async contexts
 - **Multipart/Form-Data** — File uploads with streaming support
 - **TCP Fingerprint** — JA4T-style TCP SYN fingerprinting
-
-
 
 
 

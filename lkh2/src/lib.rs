@@ -48,8 +48,8 @@ pub mod stream;
 pub const CONNECTION_PREFACE: &[u8; 24] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 
 pub use driver::{
-    spawn_driver, DriverError, FirstRequest, FirstRequestResponse, NativeResponseHeaders,
-    NativeSendRequest,
+    spawn_driver, DriverError, FirstRequest, FirstRequestResponse, H2DriverConfig,
+    NativeResponseHeaders, NativeSendRequest,
 };
 
 pub use policy::{
@@ -67,6 +67,24 @@ pub async fn connect_h2_native<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    connect_h2_native_with_config(
+        tls_stream,
+        h2_profile,
+        first_request,
+        H2DriverConfig::default(),
+    )
+    .await
+}
+
+pub async fn connect_h2_native_with_config<S>(
+    tls_stream: S,
+    h2_profile: &H2Profile,
+    first_request: Option<http::Request<Option<bytes::Bytes>>>,
+    config: H2DriverConfig,
+) -> Result<UnifiedH2Connection>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let behavior = h2_profile.behavior();
 
     let (first_req, first_resp) = match first_request {
@@ -77,10 +95,15 @@ where
         None => (None, None),
     };
 
-    let (sender, handle) =
-        driver::spawn_driver_with_first_request(tls_stream, h2_profile, Some(behavior), first_req)
-            .await
-            .map_err(|e| H2Error::Handshake(e.to_string()))?;
+    let (sender, handle) = driver::spawn_driver_with_first_request_and_config(
+        tls_stream,
+        h2_profile,
+        Some(behavior),
+        first_req,
+        config,
+    )
+    .await
+    .map_err(|e| H2Error::Handshake(e.to_string()))?;
 
     match first_resp {
         Some(resp) => Ok(UnifiedH2Connection::from_native_with_first(

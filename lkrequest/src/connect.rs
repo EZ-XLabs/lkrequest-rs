@@ -401,6 +401,7 @@ impl ConnectConfig {
 ///
 /// This is the shared implementation for all call sites. The proxy→direct
 /// fallback is controlled by `config.proxy_to_direct_fallback`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn connect_tcp(
     host: &str,
     port: u16,
@@ -408,6 +409,7 @@ pub(crate) async fn connect_tcp(
     tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
     tcp_timeout: Duration,
+    connection_budget: Option<crate::connection_pool::ConnectionBudget>,
     config: &ConnectConfig,
 ) -> Result<TcpStream> {
     if let Some(proxy_cfg) = proxy {
@@ -431,7 +433,14 @@ pub(crate) async fn connect_tcp(
 
         let proxy_result = tokio::time::timeout(
             proxy_timeout,
-            proxy_cfg.connect(host, port, tcp_fingerprint, resolver),
+            proxy_cfg.connect_with_budget(
+                host,
+                port,
+                tcp_fingerprint,
+                resolver,
+                proxy_timeout,
+                connection_budget.clone(),
+            ),
         )
         .await
         .map_err(|_| {
@@ -451,12 +460,28 @@ pub(crate) async fn connect_tcp(
                     fallback = "proxy_to_direct",
                     "http.proxy_failed_falling_back_to_direct",
                 );
-                connect_tcp_direct(host, port, tcp_fingerprint, resolver, tcp_timeout).await
+                connect_tcp_direct(
+                    host,
+                    port,
+                    tcp_fingerprint,
+                    resolver,
+                    tcp_timeout,
+                    connection_budget,
+                )
+                .await
             }
             Err(e) => Err(e),
         }
     } else {
-        connect_tcp_direct(host, port, tcp_fingerprint, resolver, tcp_timeout).await
+        connect_tcp_direct(
+            host,
+            port,
+            tcp_fingerprint,
+            resolver,
+            tcp_timeout,
+            connection_budget,
+        )
+        .await
     }
 }
 
@@ -467,6 +492,7 @@ async fn connect_tcp_direct(
     tcp_fingerprint: Option<&crate::tcp_fingerprint::TcpFingerprint>,
     resolver: &dyn crate::dns::DnsResolver,
     tcp_timeout: Duration,
+    connection_budget: Option<crate::connection_pool::ConnectionBudget>,
 ) -> Result<TcpStream> {
     tracing::debug!(
         addr = %format_args!("{}:{}", host, port),
@@ -477,7 +503,14 @@ async fn connect_tcp_direct(
 
     tokio::time::timeout(
         tcp_timeout,
-        crate::tcp_fingerprint::connect_tcp_with_fingerprint(host, port, tcp_fingerprint, resolver),
+        crate::tcp_fingerprint::connect_tcp_with_fingerprint(
+            host,
+            port,
+            tcp_fingerprint,
+            resolver,
+            tcp_timeout,
+            connection_budget,
+        ),
     )
     .await
     .map_err(|_| {
@@ -495,7 +528,6 @@ async fn connect_tcp_direct(
         )
     })
 }
-
 /// Perform TLS handshake on a TCP stream and return an `EstablishedConnection`.
 pub(crate) async fn wrap_tls(
     tcp: TcpStream,

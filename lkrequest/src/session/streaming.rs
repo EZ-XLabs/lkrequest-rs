@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http::HeaderMap;
 use http_body_util::Full;
 
-use crate::connection_pool::PooledConnection;
+use crate::connection_pool::{AcquiredConnection, ConnectionPermit};
 use crate::error::{ConnectionPhase, Error, Result};
 use crate::protocol::ProtocolPolicy;
 use crate::proxy::ProxyConfig;
@@ -60,7 +60,7 @@ impl StreamRequestBuilder {
 
             match pooled {
                 #[cfg(feature = "quic-h3")]
-                Some(PooledConnection::H3(mut cached_sender)) => {
+                Some(AcquiredConnection::H3(mut cached_sender)) => {
                     let result = self.send_h3_streaming(&mut cached_sender, &target).await;
 
                     match result {
@@ -87,7 +87,7 @@ impl StreamRequestBuilder {
                         other => other,
                     }
                 }
-                Some(PooledConnection::H2(cached_sender)) => match cached_sender.ready().await {
+                Some(AcquiredConnection::H2(cached_sender)) => match cached_sender.ready().await {
                     Ok(sender) => {
                         let result = self.send_h2_streaming(sender, &target).await;
 
@@ -123,8 +123,13 @@ impl StreamRequestBuilder {
                         self.establish_and_send_streaming(&target).await
                     }
                 },
-                Some(PooledConnection::H1 { sender, conn_task }) => {
-                    self.send_h1_streaming(sender, conn_task, &target).await
+                Some(AcquiredConnection::H1 {
+                    sender,
+                    conn_task,
+                    permit,
+                }) => {
+                    self.send_h1_streaming(sender, conn_task, permit, &target)
+                        .await
                 }
                 None => self.establish_and_send_streaming(&target).await,
             }
@@ -551,7 +556,22 @@ impl StreamRequestBuilder {
                         );
                         match tcp_future.await {
                             Ok(resp) => Ok(resp),
-                            Err(tcp_error) => Err(pipeline::protocol_race_error(tcp_error, quic_error)),
+                            Err(tcp_error) if pipeline::is_connection_limit_error(&tcp_error) => {
+                                self.establish_and_send_streaming_tcp(
+                                    target,
+                                    effective_proxy_owned,
+                                    protocol_policy,
+                                    http_version_pref,
+                                    connect_start,
+                                )
+                                .await
+                                .map_err(|retry_error| {
+                                    pipeline::protocol_race_error(retry_error, quic_error)
+                                })
+                            }
+                            Err(tcp_error) => {
+                                Err(pipeline::protocol_race_error(tcp_error, quic_error))
+                            }
                         }
                     }
                 },
@@ -577,7 +597,22 @@ impl StreamRequestBuilder {
                         );
                         match quic_future.await {
                             Ok(resp) => Ok(resp),
-                            Err(quic_error) => Err(pipeline::protocol_race_error(tcp_error, quic_error)),
+                            Err(quic_error) if pipeline::is_connection_limit_error(&tcp_error) => {
+                                self.establish_and_send_streaming_tcp(
+                                    target,
+                                    effective_proxy_owned,
+                                    protocol_policy,
+                                    http_version_pref,
+                                    connect_start,
+                                )
+                                .await
+                                .map_err(|retry_error| {
+                                    pipeline::protocol_race_error(retry_error, quic_error)
+                                })
+                            }
+                            Err(quic_error) => {
+                                Err(pipeline::protocol_race_error(tcp_error, quic_error))
+                            }
                         }
                     }
                 },
@@ -599,6 +634,7 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send + 'a>>
     {
         Box::pin(async move {
+            let permit = self.session.reserve_connection()?;
             let h3_conn = match self
                 .session
                 .establish_h3_connection(
@@ -661,11 +697,10 @@ impl StreamRequestBuilder {
                 .alt_svc_cache()
                 .mark_h3_validated_for_route(&discovery.route, &discovery.origin);
             let (sender, driver) = h3_conn.into_parts();
-            let driver = std::sync::Arc::new(driver);
             let mut send_sender = sender.clone();
             {
                 let mut pool = self.session.inner.pool.lock();
-                pool.insert_h3(target.conn_key.clone(), sender, driver);
+                pool.insert_h3_reserved(target.conn_key.clone(), sender, driver, permit);
             }
 
             tracing::debug!(
@@ -690,6 +725,7 @@ impl StreamRequestBuilder {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<StreamingResponse>> + Send + 'a>>
     {
         Box::pin(async move {
+            let permit = self.session.reserve_connection()?;
             let client = &self.session.inner.client;
             let connect_config =
                 pipeline::build_connect_config(client, http_version_pref, target.scheme);
@@ -712,6 +748,7 @@ impl StreamRequestBuilder {
                         client,
                         &self.session,
                         &target.conn_key,
+                        permit,
                     )
                     .await?;
 
@@ -739,6 +776,7 @@ impl StreamRequestBuilder {
                             "streaming.h2_failed_falling_back_to_h1",
                         );
 
+                        let fallback_permit = self.session.reserve_connection()?;
                         let h1_config =
                             pipeline::build_h1_only_connect_config(client, target.scheme);
                         let conn2 = self
@@ -762,7 +800,8 @@ impl StreamRequestBuilder {
                             "connection.established_via_fallback",
                         );
 
-                        self.send_h1_streaming(sender, conn_task, target).await
+                        self.send_h1_streaming(sender, conn_task, fallback_permit, target)
+                            .await
                     }
                     Err(e) => Err(e),
                 }
@@ -788,7 +827,8 @@ impl StreamRequestBuilder {
                     "connection.established",
                 );
 
-                self.send_h1_streaming(sender, conn_task, target).await
+                self.send_h1_streaming(sender, conn_task, permit, target)
+                    .await
             }
         })
     }
@@ -797,6 +837,7 @@ impl StreamRequestBuilder {
         &self,
         mut sender: hyper::client::conn::http1::SendRequest<Full<bytes::Bytes>>,
         conn_task: Arc<tokio::task::JoinHandle<()>>,
+        permit: ConnectionPermit,
         target: &pipeline::ParsedTarget,
     ) -> Result<StreamingResponse> {
         let client = &self.session.inner.client;
@@ -822,6 +863,7 @@ impl StreamRequestBuilder {
             use http_body_util::BodyExt;
 
             let _conn_task = conn_task;
+            let _permit = permit;
             while let Some(frame) = incoming.frame().await {
                 match frame {
                     Ok(f) => {

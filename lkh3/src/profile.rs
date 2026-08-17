@@ -802,6 +802,27 @@ pub fn chrome_150_quic() -> QuicProfile {
     }
 }
 
+/// Chrome 151 HTTP/3 fingerprint profile.
+///
+/// Captured from Chrome 151.0.7922.72 across Cloudflare and other public H3
+/// origins. SETTINGS and navigation PRIORITY_UPDATE match Chrome 150.
+pub fn chrome_151_h3() -> H3Profile {
+    chrome_150_h3()
+}
+
+/// Chrome 151 QUIC + HTTP/3 fingerprint profile.
+///
+/// Public-site captures confirm the Chrome 150 transport/H3 stable fields: an
+/// 8-byte Initial DCID, 1250-byte Initial datagram, 1472-byte UDP payload limit,
+/// QPACK capacity 65 536, 100 blocked streams, 103 unidirectional streams, and
+/// 65 536-byte DATAGRAM support. Path-, GREASE-, and RTT-dependent values remain
+/// intentionally modelled by the existing Chrome transport profile.
+pub fn chrome_151_quic() -> QuicProfile {
+    let mut profile = chrome_150_quic();
+    profile.h3 = chrome_151_h3();
+    profile
+}
+
 pub fn firefox_h3() -> H3Profile {
     H3Profile {
         settings: vec![
@@ -978,6 +999,25 @@ mod tests {
         let json = serde_json::to_string(&profile).unwrap();
         let decoded: QuicProfile = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, profile);
+    }
+
+    #[test]
+    fn chrome_151_matches_public_h3_capture_stable_fields() {
+        let profile = chrome_151_quic();
+
+        assert_eq!(profile.transport_params.max_idle_timeout, 30_000);
+        assert_eq!(profile.transport_params.max_udp_payload_size, Some(1472));
+        assert_eq!(profile.transport_params.initial_max_data, 15_728_640);
+        assert_eq!(profile.transport_params.initial_max_streams_bidi, 100);
+        assert_eq!(profile.transport_params.initial_max_streams_uni, 103);
+        assert_eq!(
+            profile.transport_params.max_datagram_frame_size,
+            Some(65_536)
+        );
+        assert_eq!(profile.initial_destination_connection_id_length, Some(8));
+        assert_eq!(profile.packetization.initial_datagram_size, Some(1250));
+        assert_eq!(profile.h3.settings, chrome_150_h3().settings);
+        assert_eq!(profile.h3.priority_updates, vec![(0, "u=0, i".into())]);
     }
 
     #[test]

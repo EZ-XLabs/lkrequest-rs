@@ -118,13 +118,14 @@ pub enum Tls12HandshakeAction {
     ContinueReading,
 
     /// Full handshake: server flight is complete. The caller should:
-    /// 1. Send the `client_key_exchange` (plaintext)
-    /// 2. Send ChangeCipherSpec (plaintext)
-    /// 3. Install the write keys from `traffic_keys`
-    /// 4. Send `client_finished` (encrypted with client write key)
-    /// 5. Read ChangeCipherSpec from server
-    /// 6. Install the read keys from `traffic_keys`
-    /// 7. Read server Finished (encrypted with server read key)
+    /// 1. Send `client_certificate` when present (plaintext)
+    /// 2. Send the `client_key_exchange` (plaintext)
+    /// 3. Send ChangeCipherSpec (plaintext)
+    /// 4. Install the write keys from `traffic_keys`
+    /// 5. Send `client_finished` (encrypted with client write key)
+    /// 6. Read ChangeCipherSpec from server
+    /// 7. Install the read keys from `traffic_keys`
+    /// 8. Read server Finished (encrypted with server read key)
     SendClientFlight(Tls12ClientFlight),
 
     /// Abbreviated handshake: server Finished verified. The caller should:
@@ -141,6 +142,9 @@ pub enum Tls12HandshakeAction {
 /// Data the client needs to send after the server flight (full handshake).
 #[derive(Debug)]
 pub struct Tls12ClientFlight {
+    /// Empty Certificate handshake message when the server requested client
+    /// authentication and no client certificate is configured.
+    pub client_certificate: Option<Vec<u8>>,
     /// ClientKeyExchange handshake message bytes.
     pub client_key_exchange: Vec<u8>,
     /// Client Finished handshake message bytes (to be encrypted).
@@ -325,6 +329,8 @@ pub struct Tls12Handshake {
     prf_algorithm: PrfAlgorithm,
     /// Server certificate DER bytes.
     server_certificates: Vec<Vec<u8>>,
+    /// Whether the server requested a client certificate.
+    client_certificate_requested: bool,
     /// ECDHE server key exchange parameters.
     server_kx_params: Option<ServerKxParams>,
     /// Our ephemeral key pair for ECDHE (consumed during key exchange).
@@ -385,6 +391,7 @@ impl Tls12Handshake {
             cipher_suite: None,
             prf_algorithm: PrfAlgorithm::Sha256,
             server_certificates: Vec::new(),
+            client_certificate_requested: false,
             server_kx_params: None,
             key_pair: None,
             master_secret: None,
@@ -853,11 +860,15 @@ impl Tls12Handshake {
             }
             Tls12State::WaitServerHelloDone => {
                 if msg_type == 0x0D {
-                    // CertificateRequest — skip (we don't support client certs)
+                    // CertificateRequest — no client certificate is configured,
+                    // so send an empty Certificate message in the client flight.
+                    self.client_certificate_requested = true;
                     if let Some(ref mut t) = self.transcript {
                         t.update(full_msg);
                     }
-                    tracing::debug!("Skipping CertificateRequest (client cert not supported)");
+                    tracing::debug!(
+                        "tls12.certificate_request_received — will send empty client certificate"
+                    );
                     Ok(Tls12HandshakeAction::ContinueReading)
                 } else if msg_type == 0x0E {
                     // ServerHelloDone
@@ -1167,6 +1178,15 @@ impl Tls12Handshake {
             Tls12KeyExchange::Rsa => self.build_rsa_key_exchange()?,
         };
 
+        let client_certificate = self
+            .client_certificate_requested
+            .then(|| build_handshake_message(handshake_type::CERTIFICATE, &[0, 0, 0]));
+        if let Some(ref certificate) = client_certificate {
+            if let Some(ref mut t) = self.transcript {
+                t.update(certificate);
+            }
+        }
+
         // Feed CKE into transcript
         if let Some(ref mut t) = self.transcript {
             t.update(&client_key_exchange);
@@ -1235,6 +1255,7 @@ impl Tls12Handshake {
         self.state = Tls12State::WaitServerChangeCipherSpec;
 
         Ok(Tls12HandshakeAction::SendClientFlight(Tls12ClientFlight {
+            client_certificate,
             client_key_exchange,
             client_finished,
             traffic_keys: Tls12TrafficKeys {
@@ -1894,6 +1915,7 @@ mod tests {
         let action = hs.process_handshake_record(&shd_record).unwrap();
         match action {
             Tls12HandshakeAction::SendClientFlight(flight) => {
+                assert!(flight.client_certificate.is_none());
                 assert!(!flight.client_key_exchange.is_empty());
                 assert!(!flight.client_finished.is_empty());
                 assert_eq!(
@@ -1915,14 +1937,26 @@ mod tests {
     }
 
     #[test]
-    fn certificate_request_before_shd_is_skipped() {
+    fn certificate_request_produces_empty_client_certificate() {
         let mut hs = new_test_handshake();
         setup_to_wait_shd(&mut hs);
-        // CertificateRequest (0x0D) should be skipped
         let cr_record = build_handshake_message(0x0D, &[0x01, 0x01, 0x00, 0x00, 0x00]);
         let action = hs.process_handshake_record(&cr_record).unwrap();
         assert!(matches!(action, Tls12HandshakeAction::ContinueReading));
         assert_eq!(hs.state(), Tls12State::WaitServerHelloDone);
+
+        let action = hs
+            .process_handshake_record(&build_handshake_message(0x0E, &[]))
+            .unwrap();
+        match action {
+            Tls12HandshakeAction::SendClientFlight(flight) => {
+                assert_eq!(
+                    flight.client_certificate.as_deref(),
+                    Some(&[handshake_type::CERTIFICATE, 0, 0, 3, 0, 0, 0][..])
+                );
+            }
+            other => panic!("expected SendClientFlight, got {other:?}"),
+        }
     }
 
     // ========================================================================

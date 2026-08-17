@@ -2519,7 +2519,7 @@ mod tests {
     #[test]
     fn test_build_firefox_147_contains_ech_grease() {
         let profile = presets::firefox_147();
-        let builder = ClientHelloBuilder::new(&profile, "example.com");
+        let builder = ClientHelloBuilder::new(&profile, "tls.browserleaks.com");
         let output = builder.build().expect("build should succeed");
 
         let msg = &output.message;

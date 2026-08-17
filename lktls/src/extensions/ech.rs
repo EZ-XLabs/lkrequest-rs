@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn test_ech_grease_firefox_config() {
         let config = firefox_grease_config();
-        let ext = EchGreaseExtension::new(&config, "example.com", 0x7F);
+        let ext = EchGreaseExtension::new(&config, "tls.browserleaks.com", 0x7F);
 
         let mut buf = Vec::new();
         ext.encode(&mut buf);

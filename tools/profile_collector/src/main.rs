@@ -312,6 +312,8 @@ enum ChromePresetVersion {
     Chrome149,
     #[value(name = "chrome_150")]
     Chrome150,
+    #[value(name = "chrome_151")]
+    Chrome151,
 }
 
 struct CaptureChromeOptions {
@@ -2231,14 +2233,18 @@ fn chrome_base_tls_profile(version: ChromePresetVersion) -> lktls::profile::type
         ChromePresetVersion::Chrome148 => lktls::profile::presets::chrome_148(),
         ChromePresetVersion::Chrome149 => lktls::profile::presets::chrome_149(),
         ChromePresetVersion::Chrome150 => lktls::profile::presets::chrome_150(),
+        ChromePresetVersion::Chrome151 => lktls::profile::presets::chrome_151(),
     }
 }
 
 fn chrome_quic_tls_profile(version: ChromePresetVersion) -> lktls::profile::types::TlsProfile {
     use lktls::profile::types::{ext_type, ExtensionSource, ExtensionSpec, TlsVersion};
 
-    if matches!(version, ChromePresetVersion::Chrome146) {
-        return lktls::profile::presets::chrome_146_quic();
+    match version {
+        ChromePresetVersion::Chrome146 => return lktls::profile::presets::chrome_146_quic(),
+        ChromePresetVersion::Chrome150 => return lktls::profile::presets::chrome_150_quic(),
+        ChromePresetVersion::Chrome151 => return lktls::profile::presets::chrome_151_quic(),
+        _ => {}
     }
 
     let mut profile = chrome_base_tls_profile(version);
@@ -2314,12 +2320,15 @@ fn chrome_h2_profile(version: ChromePresetVersion) -> lkh2::profile::H2Profile {
         ChromePresetVersion::Chrome148 => lkh2::profile::chrome_148_h2(),
         ChromePresetVersion::Chrome149 => lkh2::profile::chrome_149_h2(),
         ChromePresetVersion::Chrome150 => lkh2::profile::chrome_150_h2(),
+        ChromePresetVersion::Chrome151 => lkh2::profile::chrome_151_h2(),
     }
 }
 
 fn chrome_quic_profile(version: ChromePresetVersion) -> lkh3::QuicProfile {
     match version {
         ChromePresetVersion::Chrome146 => lkh3::chrome_146_quic(),
+        ChromePresetVersion::Chrome150 => lkh3::chrome_150_quic(),
+        ChromePresetVersion::Chrome151 => lkh3::chrome_151_quic(),
         _ => lkh3::chrome_quic(),
     }
 }

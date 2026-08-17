@@ -7,7 +7,7 @@
 //!
 //! | Profile | Status | Reference data | JA3/JA4 test |
 //! |---------|--------|----------------|--------------|
-//! | [`chrome_144`] | **Verified** | example.com live verification | `e2e_fingerprint.rs` |
+//! | [`chrome_144`] | **Verified** | tls.browserleaks.com live verification | `e2e_fingerprint.rs` |
 //! | [`chrome_145`] | **Verified (capture)** | `profile-collector` real Chrome 145 capture | none |
 //! | [`chrome_147`] | **Verified (capture)** | `profile-collector` real Chrome 147 capture | none |
 //! | [`chrome_148`] | **Verified (capture)** | `profile-collector` real Chrome 148 capture | none |
@@ -35,7 +35,7 @@ pub fn chrome_131() -> TlsProfile {
 
 /// Load the built-in Chrome 144 profile.
 ///
-/// **Verified** — live-verified via example.com JA3/JA4/Akamai H2 fingerprints.
+/// **Verified** — live-verified via tls.browserleaks.com JA3/JA4/Akamai H2 fingerprints.
 /// Chrome 144 includes X25519MLKEM768 post-quantum key exchange and ECH.
 pub fn chrome_144() -> TlsProfile {
     let json_str = include_str!("../../profiles/chrome_144.json");
@@ -164,6 +164,30 @@ pub fn chrome_150_quic() -> TlsProfile {
     chromium_quic_profile(chrome_150(), "Chrome 150 QUIC")
 }
 
+/// Load the built-in Chrome 151 profile.
+///
+/// **Verified (capture)** — captured from real Chrome 151.0.7922.72 via
+/// `profile-collector` on 2026-07-31. Stable TCP TLS and H2 fields are
+/// unchanged from Chrome 150; only per-connection extension-order shuffle and
+/// random GREASE differ.
+pub fn chrome_151() -> TlsProfile {
+    let json_str = include_str!("../../profiles/chrome_151.json");
+    serde_json::from_str(json_str).expect("built-in chrome_151 profile should be valid")
+}
+
+/// Chrome 151 QUIC ClientHello profile.
+///
+/// Verified across real QUIC connections to Cloudflare, Google, Slack, and
+/// other public H3 origins. Unlike Chrome 151 TCP, QUIC omits the three ML-DSA
+/// signature algorithms and keeps the classic list plus `rsa_pkcs1_sha1`.
+pub fn chrome_151_quic() -> TlsProfile {
+    let mut profile = chromium_quic_profile(chrome_151(), "Chrome 151 QUIC");
+    profile
+        .signature_algorithms
+        .retain(|algorithm| !matches!(*algorithm, 0x0904..=0x0906));
+    profile
+}
+
 /// Load the built-in Firefox 133 profile.
 ///
 /// **Unverified** — lacks real browser reference data and has not undergone JA3/JA4 consistency testing.
@@ -224,6 +248,7 @@ mod tests {
             chrome_148(),
             chrome_149(),
             chrome_150(),
+            chrome_151(),
         ] {
             assert_eq!(
                 profile.tls_client_hello_style,
@@ -306,6 +331,15 @@ mod tests {
         e150.sort_unstable();
         e149.sort_unstable();
         assert_eq!(e150, e149);
+    }
+
+    #[test]
+    fn chrome_151_matches_chrome_150_tcp_stable_fields() {
+        let mut c151 = serde_json::to_value(chrome_151()).unwrap();
+        let mut c150 = serde_json::to_value(chrome_150()).unwrap();
+        c151.as_object_mut().unwrap().remove("name");
+        c150.as_object_mut().unwrap().remove("name");
+        assert_eq!(c151, c150);
     }
 
     #[test]
@@ -397,6 +431,17 @@ mod tests {
         );
         assert_eq!(quic.signature_algorithms.last(), Some(&0x0201));
         assert_eq!(&quic.signature_algorithms[..3], &[0x0904, 0x0905, 0x0906]);
+    }
+
+    #[test]
+    fn chrome_151_quic_matches_public_h3_capture_signature_algorithms() {
+        let quic = chrome_151_quic();
+
+        assert_eq!(quic.name, "Chrome 151 QUIC");
+        assert_eq!(
+            quic.signature_algorithms,
+            vec![0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601, 0x0201]
+        );
     }
 
     #[test]

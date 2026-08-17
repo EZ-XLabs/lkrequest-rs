@@ -23,7 +23,7 @@ use lktls::session_store::InMemorySessionStore;
 use lktls::KeyLogCallback;
 use rustls_pki_types::TrustAnchor;
 
-use crate::dns::{DnsConfig, DnsResolver, SystemDns};
+use crate::dns::{DnsConfig, DnsResolver, SystemDns, SystemDnsCacheConfig};
 use crate::h2::H2Profile;
 use crate::protocol::ProtocolPolicy;
 use crate::session::SessionBuilder;
@@ -510,6 +510,9 @@ pub(crate) struct ClientInner {
     /// Resource limits (body size, header limits, connection caps, etc.).
     pub resource_limits: ResourceLimits,
 
+    /// Optional bound for HTTP/2 requests waiting on remote stream capacity.
+    pub max_pending_h2_requests: Option<usize>,
+
     /// Optional TLS key log callback for SSLKEYLOGFILE output.
     pub keylog_callback: Option<KeyLogCallback>,
 
@@ -639,6 +642,13 @@ impl Client {
     /// Returns the resource limits configuration.
     pub fn resource_limits(&self) -> &ResourceLimits {
         &self.inner.resource_limits
+    }
+
+    /// Returns the configured HTTP/2 pending-request bound.
+    ///
+    /// None means requests waiting for remote stream capacity are unbounded.
+    pub fn max_pending_h2_requests(&self) -> Option<usize> {
+        self.inner.max_pending_h2_requests
     }
 
     /// Returns the connect timeout (TCP + TLS combined, for backward compat).
@@ -797,6 +807,7 @@ pub struct ClientBuilder {
     middlewares: crate::middleware::MiddlewareStack,
     timeouts: TimeoutConfig,
     resource_limits: ResourceLimits,
+    max_pending_h2_requests: Option<usize>,
     keylog_callback: Option<KeyLogCallback>,
     verify: bool,
     resolver: Option<Arc<dyn DnsResolver>>,
@@ -822,6 +833,7 @@ impl ClientBuilder {
             middlewares: Vec::new(),
             timeouts: TimeoutConfig::default(),
             resource_limits: ResourceLimits::default(),
+            max_pending_h2_requests: None,
             keylog_callback: None,
             verify: true,
             resolver: None,
@@ -886,6 +898,23 @@ impl ClientBuilder {
     /// If not set, defaults to Chrome 144 H2 profile.
     pub fn h2_profile(mut self, profile: H2Profile) -> Self {
         self.h2_profile = Some(profile);
+        self
+    }
+
+    /// Bound the number of HTTP/2 requests waiting for a remote stream slot.
+    ///
+    /// The default is unbounded. Once this positive limit is reached, later
+    /// requests wait asynchronously until an earlier request is assigned a
+    /// stream; they do not fail with a local capacity error.
+    pub fn max_pending_h2_requests(mut self, max: usize) -> Self {
+        assert!(max > 0, "max_pending_h2_requests must be greater than zero");
+        self.max_pending_h2_requests = Some(max);
+        self
+    }
+
+    /// Restore the default unbounded HTTP/2 pending-request queue.
+    pub fn unbounded_pending_h2_requests(mut self) -> Self {
+        self.max_pending_h2_requests = None;
         self
     }
 
@@ -1450,6 +1479,35 @@ impl ClientBuilder {
         self
     }
 
+    /// Use the operating-system DNS resolver with a positive-result cache.
+    ///
+    /// The default system resolver already coalesces concurrent identical
+    /// lookups process-wide and does not cache completed results. This method
+    /// additionally enables an instance-local cache for successful lookups.
+    /// Errors and empty results are never cached.
+    ///
+    /// Like [`.dns()`](Self::dns) and [`.dns_resolver()`](Self::dns_resolver),
+    /// this replaces the resolver currently configured on the builder, so the
+    /// last resolver-setting call wins.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use std::time::Duration;
+    /// use lkrequest::{Client, SystemDnsCacheConfig};
+    ///
+    /// let client = Client::builder()
+    ///     .system_dns_cache(
+    ///         SystemDnsCacheConfig::positive(Duration::from_secs(30))
+    ///             .with_max_entries(4096),
+    ///     )
+    ///     .build();
+    /// ```
+    pub fn system_dns_cache(mut self, config: SystemDnsCacheConfig) -> Self {
+        self.resolver = Some(Arc::new(SystemDns::with_cache(config)));
+        self
+    }
+
     /// Set a custom DNS resolver implementation.
     ///
     /// Use this for full control over DNS resolution. The resolver must
@@ -1584,6 +1642,7 @@ impl ClientBuilder {
                 middlewares: self.middlewares,
                 timeouts: self.timeouts,
                 resource_limits: self.resource_limits,
+                max_pending_h2_requests: self.max_pending_h2_requests,
                 keylog_callback: self.keylog_callback,
                 verify: self.verify,
                 resolver,
@@ -1600,6 +1659,30 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pending_h2_requests_default_to_unbounded() {
+        let client = Client::builder().build();
+        assert_eq!(client.max_pending_h2_requests(), None);
+    }
+
+    #[test]
+    fn pending_h2_request_limit_can_be_set_and_cleared() {
+        let bounded = Client::builder().max_pending_h2_requests(128).build();
+        assert_eq!(bounded.max_pending_h2_requests(), Some(128));
+
+        let unbounded = Client::builder()
+            .max_pending_h2_requests(128)
+            .unbounded_pending_h2_requests()
+            .build();
+        assert_eq!(unbounded.max_pending_h2_requests(), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_pending_h2_requests must be greater than zero")]
+    fn zero_pending_h2_request_limit_is_rejected() {
+        let _ = Client::builder().max_pending_h2_requests(0);
+    }
 
     // -- TimeoutConfig -----------------------------------------------------
 
@@ -2110,6 +2193,14 @@ mod tests {
             .build();
         assert_eq!(client2.tls_profile().name, "Chrome 144");
         let _ = client2.resolver();
+
+        let cached = Client::builder()
+            .system_dns_cache(SystemDnsCacheConfig::positive(Duration::from_secs(30)))
+            .build();
+        assert!(cached
+            .resolver()
+            .resolver_impl_name()
+            .ends_with("CachedSystemDns"));
     }
 
     // -- Convenience request builders --------------------------------------
